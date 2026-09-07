@@ -16,14 +16,15 @@ from case_management.gql_mutations import (
     UpdatePaymentDetailsMutation, UpdatePaymentPhoneMutation,
 )
 from case_management.gql_queries import (
+    CaseManagementSummaryGQLType, CaseStatusCountGQLType,
     PaymentAccountCorrectionGQLType,
     CaseFollowUpRemarkGQLType,
     CaseHouseholdDeactivationGQLType, CaseMemberDeactivationGQLType,
     CasePaymentChangeAuditGQLType, CasePendingDataUpdateGQLType,
 )
 from case_management.models import (
-    FollowUpRemark, HouseholdDeactivation, MemberDeactivation, OPEN_FOLLOW_UP_STATUSES,
-    PaymentChangeAudit, PendingDataUpdate, PendingStatus,
+    FollowUpRemark, FollowUpStatus, HouseholdDeactivation, MemberDeactivation,
+    OPEN_FOLLOW_UP_STATUSES, PaymentChangeAudit, PendingDataUpdate, PendingStatus,
 )
 
 
@@ -52,8 +53,41 @@ class Query(graphene.ObjectType):
     case_follow_up_remark = OrderedDjangoFilterConnectionField(
         CaseFollowUpRemarkGQLType, orderBy=graphene.List(of_type=graphene.String),
         overdue_only=graphene.Boolean())
+    case_management_summary = graphene.Field(CaseManagementSummaryGQLType)
+
     case_pending_data_update = OrderedDjangoFilterConnectionField(
         CasePendingDataUpdateGQLType, orderBy=graphene.List(of_type=graphene.String))
+
+    def resolve_case_management_summary(self, info, **kwargs):
+        from datetime import date
+
+        from django.db.models import Count
+
+        from tasaf_payment.models import PaymentAccount, VerificationStatus
+
+        _check(info.context.user, CaseManagementConfig.gql_case_search_perms)
+
+        live = {'is_deleted': False}
+        follow_ups = FollowUpRemark.objects.filter(**live)
+        pending = PendingDataUpdate.objects.filter(**live)
+
+        def by_status(qs):
+            rows = qs.values('status').order_by('status').annotate(c=Count('id'))
+            return [CaseStatusCountGQLType(status=r['status'], count=r['c']) for r in rows]
+
+        return CaseManagementSummaryGQLType(
+            open_corrections=PaymentAccount.objects.filter(
+                is_deleted=False, verification_status=VerificationStatus.FAILED).count(),
+            open_follow_ups=follow_ups.filter(status__in=OPEN_FOLLOW_UP_STATUSES).count(),
+            overdue_follow_ups=follow_ups.filter(
+                status__in=OPEN_FOLLOW_UP_STATUSES, due_date__lt=date.today()).count(),
+            pending_updates=pending.filter(status=PendingStatus.PENDING).count(),
+            households_deactivated=HouseholdDeactivation.objects.filter(**live).count(),
+            members_deactivated=MemberDeactivation.objects.filter(**live).count(),
+            payment_changes=PaymentChangeAudit.objects.filter(**live).count(),
+            follow_ups_by_status=by_status(follow_ups),
+            pending_by_status=by_status(pending),
+        )
 
     def resolve_account_correction(self, info, **kwargs):
         """Failed accounts, newest failure first. Corrected accounts leave this list on

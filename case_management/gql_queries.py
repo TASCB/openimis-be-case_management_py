@@ -208,3 +208,20 @@ class PaymentAccountCorrectionGQLType(DjangoObjectType):
         group = getattr(getattr(root, 'group_beneficiary', None), 'group', None)
         location = getattr(group, 'location', None)
         return getattr(location, 'name', None)
+
+
+class CaseStatusCountGQLType(graphene.ObjectType):
+    status = graphene.String()
+    count = graphene.Int()
+
+
+class CaseManagementSummaryGQLType(graphene.ObjectType):
+    open_corrections = graphene.Int()
+    open_follow_ups = graphene.Int()
+    overdue_follow_ups = graphene.Int()
+    pending_updates = graphene.Int()
+    households_deactivated = graphene.Int()
+    members_deactivated = graphene.Int()
+    payment_changes = graphene.Int()
+    follow_ups_by_status = graphene.List(CaseStatusCountGQLType)
+    pending_by_status = graphene.List(CaseStatusCountGQLType)
