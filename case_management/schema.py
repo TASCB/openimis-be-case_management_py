@@ -16,7 +16,7 @@ from case_management.gql_mutations import (
     UpdatePaymentDetailsMutation, UpdatePaymentPhoneMutation,
 )
 from case_management.gql_queries import (
-    CaseManagementSummaryGQLType, CaseStatusCountGQLType,
+    CaseChannelCountGQLType, CaseManagementSummaryGQLType, CaseStatusCountGQLType,
     PaymentAccountCorrectionGQLType,
     CaseFollowUpRemarkGQLType,
     CaseHouseholdDeactivationGQLType, CaseMemberDeactivationGQLType,
@@ -41,7 +41,8 @@ class Query(graphene.ObjectType):
         location_id=graphene.Int(required=False),
         hhid=graphene.String(required=False),
         recipient_name=graphene.String(required=False),
-        description="Payment accounts that failed verification and need correcting.",
+        reason=graphene.String(required=False),
+        description="Payment accounts to correct: reason VERIFICATION_FAILED (default) or INVALID_MOBILE.",
     )
 
     case_payment_change_audit = OrderedDjangoFilterConnectionField(
@@ -75,6 +76,9 @@ class Query(graphene.ObjectType):
             rows = qs.values('status').order_by('status').annotate(c=Count('id'))
             return [CaseStatusCountGQLType(status=r['status'], count=r['c']) for r in rows]
 
+        channel_rows = (pending.filter(status=PendingStatus.PENDING)
+                        .values('channel').order_by('channel').annotate(c=Count('id')))
+
         return CaseManagementSummaryGQLType(
             open_corrections=PaymentAccount.objects.filter(
                 is_deleted=False, verification_status=VerificationStatus.FAILED).count(),
@@ -87,17 +91,24 @@ class Query(graphene.ObjectType):
             payment_changes=PaymentChangeAudit.objects.filter(**live).count(),
             follow_ups_by_status=by_status(follow_ups),
             pending_by_status=by_status(pending),
+            pending_by_channel=[CaseChannelCountGQLType(channel=r['channel'], count=r['c'])
+                                for r in channel_rows],
         )
 
     def resolve_account_correction(self, info, **kwargs):
-        """Failed accounts, newest failure first. Corrected accounts leave this list on
-        their own: CasePaymentService resets them to PENDING for the next bulk run."""
+        """Accounts to correct: failed verification (default), or mobile-money accounts whose
+        number is not 255 + 9 digits. Corrected accounts leave the list on their own."""
         _check(info.context.user, CaseManagementConfig.gql_account_correction_search_perms)
         from tasaf_payment.models import PaymentAccount, VerificationStatus
+        from tasaf_payment.msisdn import MSISDN_DB_PATTERN
 
-        qs = PaymentAccount.objects.filter(
-            is_deleted=False, verification_status=VerificationStatus.FAILED,
-        ).select_related('group_beneficiary__group')
+        if kwargs.get('reason') == 'INVALID_MOBILE':
+            qs = PaymentAccount.objects.filter(is_deleted=False, fsp_type='MOBILE').exclude(
+                account_number__regex=MSISDN_DB_PATTERN)
+        else:
+            qs = PaymentAccount.objects.filter(
+                is_deleted=False, verification_status=VerificationStatus.FAILED)
+        qs = qs.select_related('group_beneficiary__group')
 
         if kwargs.get('location_id'):
             qs = qs.filter(group_beneficiary__group__location_id=kwargs['location_id'])

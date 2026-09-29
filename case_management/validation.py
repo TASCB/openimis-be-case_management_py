@@ -8,6 +8,7 @@ CM_NO_CHANGE = 'CM_NO_CHANGE'
 CM_USE_PHONE_MUTATION = 'CM_USE_PHONE_MUTATION'
 CM_USE_PAYMENT_MUTATION = 'CM_USE_PAYMENT_MUTATION'
 CM_INVALID_PHONE = 'CM_INVALID_PHONE'
+CM_INVALID_MOBILE_ACCOUNT = 'CM_INVALID_MOBILE_ACCOUNT'
 CM_ACTIVE_MEMBERS_EXIST = 'CM_ACTIVE_MEMBERS_EXIST'
 CM_SUCCESSOR_REQUIRED = 'CM_SUCCESSOR_REQUIRED'
 CM_PAYMENT_IN_FLIGHT = 'CM_PAYMENT_IN_FLIGHT'
@@ -20,6 +21,7 @@ CM_INVALID_EFFECTIVE_DATE = 'CM_INVALID_EFFECTIVE_DATE'
 CM_SELF_APPROVAL = 'CM_SELF_APPROVAL'
 CM_NOT_FOUND = 'CM_NOT_FOUND'
 CM_TASK_CREATE_FAILED = 'CM_TASK_CREATE_FAILED'
+CM_ALREADY_DECIDED = 'CM_ALREADY_DECIDED'
 
 PHONE_RE = re.compile(r'^(?:\+255|0)[67]\d{8}$')
 OTHER = 'OTHER'
@@ -64,6 +66,13 @@ def validate_reason(reason_code, reason_text, vocabulary, required, min_text_len
 def validate_phone(value):
     require(value and PHONE_RE.match(value.strip()), CM_INVALID_PHONE,
             'Enter a Tanzanian mobile number, e.g. +255712345678 or 0712345678')
+
+
+def validate_mobile_account(fsp_type, account_number):
+    from tasaf_payment import msisdn
+    if fsp_type == 'MOBILE':
+        require(msisdn.is_valid(msisdn.normalise(account_number)), CM_INVALID_MOBILE_ACCOUNT,
+                'Enter a Tanzanian mobile number: 255 followed by 9 digits starting with 6 or 7')
 
 
 def validate_effective_date(effective_date, not_before=None):

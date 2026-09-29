@@ -22,6 +22,13 @@ DEFAULT_PAYMENT_CHANGE_REASONS = [
     'NAME_MISMATCH', 'DATA_CORRECTION', 'OTHER',
 ]
 
+# Severity of a household/member edit = the highest level among its changed fields. A field is
+# matched by name, so `national_id` also matches `json_ext.national_id`; unlisted fields are INFO.
+DEFAULT_DATA_UPDATE_SEVERITY = {
+    'CRITICAL': ['recipient_type', 'role', 'national_id', 'location_id', 'individuals_data'],
+    'WARNING': ['first_name', 'last_name', 'dob', 'sex', 'group_id', 'code'],
+}
+
 DEFAULT_CONFIG = {
     # Household case console
     'gql_case_search_perms': ['290101'],
@@ -60,6 +67,7 @@ DEFAULT_CONFIG = {
     'household_deactivation_reasons': DEFAULT_HOUSEHOLD_DEACTIVATION_REASONS,
     'member_deactivation_reasons': DEFAULT_MEMBER_DEACTIVATION_REASONS,
     'payment_change_reasons': DEFAULT_PAYMENT_CHANGE_REASONS,
+    'data_update_severity': DEFAULT_DATA_UPDATE_SEVERITY,
 
     'seed_rights': True,
 }
@@ -112,6 +120,7 @@ class CaseManagementConfig(AppConfig):
     household_deactivation_reasons = DEFAULT_HOUSEHOLD_DEACTIVATION_REASONS
     member_deactivation_reasons = DEFAULT_MEMBER_DEACTIVATION_REASONS
     payment_change_reasons = DEFAULT_PAYMENT_CHANGE_REASONS
+    data_update_severity = DEFAULT_DATA_UPDATE_SEVERITY
 
     seed_rights = True
 
@@ -120,8 +129,10 @@ class CaseManagementConfig(AppConfig):
         cfg = ModuleConfiguration.get_or_default(MODULE_NAME, DEFAULT_CONFIG)
         self.__load_config(cfg)
         post_migrate.connect(on_post_migrate, sender=self)
-        from case_management.signals import bind_service_signals
-        bind_service_signals()
+        # Service signals are bound by openIMIS's signal_binding crawler, after individual's task
+        # executors; binding here would put our complete_task handlers ahead of them.
+        from case_management.mutation_context import connect
+        connect()
 
     @classmethod
     def __load_config(cls, cfg):

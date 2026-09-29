@@ -77,8 +77,13 @@ def classify(before, after):
 
 
 def resolve_channel(explicit=None, request=None):
+    """Explicit argument, then the mutation's `mutationExtensions.channel`, then user agent."""
     if explicit:
         return explicit
+    from case_management.mutation_context import current_channel
+    declared = current_channel()
+    if declared:
+        return declared
     if request is not None:
         agent = (request.META.get('HTTP_USER_AGENT') or '').lower()
         if 'okhttp' in agent or 'dart' in agent or 'coremis-mobile' in agent:
@@ -130,11 +135,24 @@ class PaymentChangeService:
         })
         if not result.get('success'):
             raise v.CaseValidationError('CM_TASK_CREATE_FAILED', result.get('detail'))
-        return output_result_success({
-            'queued': True,
-            'task_id': (result.get('data') or {}).get('id'),
-            **summary,
-        })
+        task_id = (result.get('data') or {}).get('id')
+        self._list_for_decision(entity, task_id, payload)
+        return output_result_success({'queued': True, 'task_id': task_id, **summary})
+
+    def _list_for_decision(self, account, task_id, payload):
+        """Put the queued change on Pending updates, where a checker with the decide right
+        approves or rejects it; without this row the task reaches no one."""
+        from tasks_management.models import Task
+
+        task = Task.objects.filter(id=task_id).first()
+        if task is None:
+            return
+        PendingUpdateService(self.user).open(
+            target=account, update_type=UpdateType.PAYMENT_CHANGE, group=self._group_of(account),
+            severity=Severity.CRITICAL, task=task, is_proposal=True,
+            channel=payload.get('channel'),
+            summary={'fields': sorted(payload.get('fields') or {}), 'reason_code': payload.get('reason_code'),
+                     'source': 'payment_change'})
 
     @check_authentication
     @register_service_signal('case_payment_service.update_details')
@@ -149,9 +167,13 @@ class PaymentChangeService:
         v.require('contact_phone' not in fields, v.CM_USE_PHONE_MUTATION,
                   'Use the phone update to change contact_phone')
 
+        channel = resolve_channel(channel, request)
         before = {f: getattr(account, f) for f in TRACKED_PAYMENT_FIELDS}
         change_type, is_material, changed = classify(before, fields)
         v.require(changed, v.CM_NO_CHANGE, 'Nothing was changed')
+        if 'account_number' in fields or 'fsp_type' in fields:
+            v.validate_mobile_account(fields.get('fsp_type', account.fsp_type),
+                                      fields.get('account_number', account.account_number))
 
         v.validate_reason(
             reason_code, reason_text,
@@ -167,7 +189,7 @@ class PaymentChangeService:
                  'fields': {k: d['after'] for k, d in changed.items()},
                  'previous': {k: d['before'] for k, d in changed.items()},
                  'reason_code': reason_code, 'reason_text': reason_text,
-                 'channel': str(resolve_channel(channel, request))},
+                 'channel': str(channel)},
                 {'change_type': str(change_type), 'is_material': True})
 
         with _owning_the_change(), transaction.atomic():
@@ -188,7 +210,7 @@ class PaymentChangeService:
                 changed_fields=changed,
                 reason_code=reason_code,
                 reason_text=reason_text,
-                channel=resolve_channel(channel, request),
+                channel=channel,
                 previous_verification_status=previous_verification,
                 previous_pre_audit_status=previous_pre_audit,
             )
@@ -200,12 +222,12 @@ class PaymentChangeService:
                 if approval_request:
                     audit.approval_request = approval_request
                     audit.save(user=self.user)
-            if is_material:
+            if is_material and not _approved:
                 PendingUpdateService(self.user).open(
                     target=account, update_type=UpdateType.PAYMENT_CHANGE,
                     severity=Severity.CRITICAL,
                     group=self._group_of(account),
-                    approval_request=approval_request,
+                    approval_request=approval_request, channel=channel,
                     summary={'change_type': str(change_type),
                              'fields': sorted(changed),
                              'reason_code': reason_code})
@@ -224,6 +246,7 @@ class PaymentChangeService:
         v.validate_version(account, version)
         v.validate_phone(contact_phone)
 
+        channel = resolve_channel(channel, request)
         phone = contact_phone.strip()
         v.require(phone != (account.contact_phone or ''), v.CM_NO_CHANGE, 'Nothing was changed')
 
@@ -238,13 +261,13 @@ class PaymentChangeService:
                 change_type=ChangeType.CONTACT_PHONE,
                 is_material=False,
                 changed_fields=changed,
-                channel=resolve_channel(channel, request),
+                channel=channel,
             )
             audit.save(user=self.user)
 
             PendingUpdateService(self.user).open(
                 target=account, update_type=UpdateType.PAYMENT_CHANGE,
-                severity=Severity.INFO, group=self._group_of(account),
+                severity=Severity.INFO, group=self._group_of(account), channel=channel,
                 summary={'change_type': str(ChangeType.CONTACT_PHONE)})
         return output_result_success({'id': str(audit.id), 'is_material': False})
 
@@ -642,12 +665,12 @@ class HouseholdCaseService:
 
     @staticmethod
     def _require_no_payment_in_flight(group):
-        from tasaf_payment.models import PaylistItem, PaylistItemStatus
+        from tasaf_payment.models import PaylistItem, PaylistItemStatus, PaylistStatus
 
         in_flight = PaylistItem.objects.filter(
             payment_account__group_beneficiary__group=group, is_deleted=False,
             status__in=[PaylistItemStatus.PENDING, PaylistItemStatus.PROCESSED],
-        ).exists()
+        ).exclude(paylist__status=PaylistStatus.REJECTED_AT_APPROVAL).exists()
         v.require(not in_flight, v.CM_PAYMENT_IN_FLIGHT,
                   'A payment is in flight for this household')
 
@@ -731,7 +754,8 @@ class PendingUpdateService:
         self.user = user
 
     def open(self, target, update_type, group=None, severity=Severity.INFO,
-             summary=None, task=None, approval_request=None):
+             summary=None, task=None, approval_request=None, channel=None,
+             is_proposal=False, location=None):
         """Open a pending row, superseding any existing one for the same target."""
         from django.contrib.contenttypes.models import ContentType
 
@@ -747,10 +771,11 @@ class PendingUpdateService:
 
         record = PendingDataUpdate(
             content_type=content_type, object_id=object_id,
-            group=group, location=(group.location if group else None),
+            group=group, location=location or (group.location if group else None),
             update_type=update_type, status=PendingStatus.PENDING,
             severity=severity, task=task, approval_request=approval_request,
-            summary=summary or {}, submitted_by=self.user)
+            summary=summary or {}, channel=resolve_channel(channel),
+            is_proposal=is_proposal, submitted_by=self.user)
         record.save(user=self.user)
         return record
 
@@ -764,6 +789,9 @@ class PendingUpdateService:
         v.require(record.submitted_by_id != getattr(self.user, 'id', None), v.CM_SELF_APPROVAL,
                   'An update cannot be approved by the person who submitted it')
 
+        if record.is_proposal and record.task_id:
+            return self._decide_proposal(record, approve, note)
+
         with transaction.atomic():
             record.status = PendingStatus.APPROVED if approve else PendingStatus.REJECTED
             record.resolved_at = timezone.now()
@@ -771,6 +799,27 @@ class PendingUpdateService:
             record.save(user=self.user)
             if not approve:
                 self._restore_rejected(record)
+                if (record.summary or {}).get('source') == DATA_UPDATE_SOURCE and record.group_id:
+                    _open_data_quality_follow_up(
+                        self.user, record,
+                        f'Flagged on review: {", ".join(record.summary.get("fields") or [])}. {note or ""}')
+        return output_result_success({'id': str(record.id), 'status': record.status})
+
+    def _decide_proposal(self, record, approve, note):
+        """Drive the task; `on_data_update_task_complete` closes the row, whoever decided."""
+        from tasks_management.models import Task
+        from tasks_management.services import TaskService
+
+        v.require(record.task.status in (Task.Status.RECEIVED, Task.Status.ACCEPTED),
+                  v.CM_ALREADY_DECIDED, 'This update was already decided in the Tasks inbox')
+        with transaction.atomic():
+            record.summary = {**(record.summary or {}), 'decision_note': note,
+                              'decided_by': str(self.user.id)}
+            record.save(user=self.user)
+            result = TaskService(self.user).complete_task({'id': record.task_id, 'failed': not approve})
+            if not result.get('success'):
+                raise v.CaseValidationError(v.CM_TASK_CREATE_FAILED, result.get('detail'))
+        record.refresh_from_db()
         return output_result_success({'id': str(record.id), 'status': record.status})
 
     def _restore_rejected(self, record):
@@ -806,3 +855,233 @@ class PendingUpdateService:
             record.save(user=self.user)
 
 
+
+
+# --- Household and member edits made through the individual module -----------------------------
+
+DATA_UPDATE_SOURCE = 'individual'
+WATCHED_TASK_EVENTS = {
+    'IndividualService.update': UpdateType.MEMBER_UPDATE,
+    'GroupIndividualService.update': UpdateType.MEMBER_UPDATE,
+    'GroupService.update': UpdateType.HOUSEHOLD_UPDATE,
+}
+DIRECT_UPDATE_MUTATIONS = {
+    'individual_service.update': 'UpdateIndividualMutation',
+    'groupindividual_service.update': 'UpdateGroupIndividualMutation',
+    'group_service.update': 'UpdateGroupMutation',
+}
+_REPRESENTATIVE_FIELDS = {'role', 'recipient_type'}
+_NOT_COMPARED = {'id', 'version', 'date_created', 'date_updated',
+                 'user_created_id', 'user_updated_id', 'is_deleted'}
+_SEVERITY_ORDER = (Severity.CRITICAL, Severity.WARNING)
+
+
+def _norm(value):
+    return None if value in (None, '') else str(value)
+
+
+def _member_ids(value):
+    return {str(m.get('individual_id')) for m in (value or []) if isinstance(m, dict)}
+
+
+def changed_field_names(before, after):
+    """Names of the fields `after` changes; json_ext keys as `json_ext.<key>`."""
+    names = set()
+    for key, new in (after or {}).items():
+        if key in _NOT_COMPARED:
+            continue
+        old = (before or {}).get(key)
+        if key == 'json_ext':
+            old = old if isinstance(old, dict) else {}
+            names |= {f'json_ext.{k}' for k, val in (new or {}).items() if _norm(old.get(k)) != _norm(val)}
+        elif key == 'individuals_data':
+            if _member_ids(old) != _member_ids(new):
+                names.add(key)
+        elif _norm(old) != _norm(new):
+            names.add(key)
+    # A top-level field mirrored into json_ext is one change, not two.
+    return sorted(n for n in names if not (n.startswith('json_ext.') and n[9:] in names))
+
+
+def data_update_severity(names):
+    levels = CaseManagementConfig.data_update_severity or {}
+    bare = {n.split('.')[-1] for n in names}
+    for level in _SEVERITY_ORDER:
+        if bare & set(levels.get(str(level), [])):
+            return level
+    return Severity.INFO
+
+
+def household_of(target):
+    """The household an edit belongs to: the group itself, the membership's group, or the
+    person's single active household (head/primary recipient first when there are several)."""
+    from individual.models import Group, GroupIndividual
+
+    if isinstance(target, Group):
+        return target
+    if isinstance(target, GroupIndividual):
+        return target.group
+    memberships = list(GroupIndividual.objects.filter(
+        individual=target, is_deleted=False, is_active=True,
+    ).select_related('group').order_by('-date_created'))
+    if not memberships:
+        return None
+    for m in memberships:
+        if m.role == GroupIndividual.Role.HEAD or m.recipient_type == GroupIndividual.RecipientType.PRIMARY:
+            return m.group
+    return memberships[0].group
+
+
+def snapshot(obj):
+    return {f.attname: getattr(obj, f.attname)
+            for f in obj._meta.concrete_fields if f.attname not in _NOT_COMPARED}
+
+
+def _value_at(values, name):
+    top, _, sub = name.partition('.')
+    value = (values or {}).get(top)
+    if sub:
+        return value.get(sub) if isinstance(value, dict) else None
+    return value
+
+
+def _task_target(task):
+    try:
+        return task.entity_type.get_object_for_this_type(id=task.entity_id)
+    except Exception:
+        return None
+
+
+def _open_data_quality_follow_up(user, record, remark):
+    result = FollowUpService(user).add(
+        group_id=record.group_id, category='DATA_QUALITY', remark=remark, priority='HIGH')
+    if not result.get('success'):
+        logger.warning('case_management: follow-up for pending update %s not opened: %s',
+                       record.id, result.get('detail'))
+
+
+class DataUpdateService:
+    """Indexes household/member edits in Pending updates. Never applies one: the individual
+    module's task executor does, when the task is completed."""
+
+    def __init__(self, user):
+        self.user = user
+
+    def propose(self, task):
+        update_type = WATCHED_TASK_EVENTS.get(task.business_event or '')
+        target = _task_target(task) if update_type else None
+        if target is None:
+            return None
+        data = task.data or {}
+        names = changed_field_names(data.get('current_data'), data.get('incoming_data'))
+        if not names:
+            return None
+        if task.business_event == 'GroupIndividualService.update' and _REPRESENTATIVE_FIELDS & set(names):
+            update_type = UpdateType.REPRESENTATIVE_CHANGE
+        group = household_of(target)
+        return PendingUpdateService(self.user).open(
+            target=target, update_type=update_type, group=group,
+            location=None if group else getattr(target, 'location', None),
+            severity=data_update_severity(names), task=task, is_proposal=True,
+            summary={'fields': names, 'source': DATA_UPDATE_SOURCE})
+
+    def record_applied(self, target, before):
+        """`before` is the snapshot taken just before the save: bulk-imported records have no
+        history row for their state before the first edit, so history alone cannot supply it."""
+        after = snapshot(target)
+        names = changed_field_names(before, after)
+        if not names:
+            return None
+        latest = target.history.order_by('-history_date').first()
+        update_type = UpdateType.HOUSEHOLD_UPDATE if target._meta.model_name == 'group' else (
+            UpdateType.REPRESENTATIVE_CHANGE if _REPRESENTATIVE_FIELDS & set(names)
+            else UpdateType.MEMBER_UPDATE)
+        group = household_of(target)
+        return PendingUpdateService(self.user).open(
+            target=target, update_type=update_type, group=group,
+            location=None if group else getattr(target, 'location', None),
+            severity=data_update_severity(names),
+            summary={'fields': names, 'source': DATA_UPDATE_SOURCE,
+                     'before': {n: _plain(_value_at(before, n)) for n in names},
+                     'history_id': str(latest.history_id) if latest else None})
+
+    def close_for_task(self, task):
+        from tasks_management.models import Task
+
+        record = PendingDataUpdate.objects.filter(
+            task_id=task.id, status=PendingStatus.PENDING, is_deleted=False).first()
+        if not record:
+            return None
+        summary = dict(record.summary or {})
+        summary.setdefault('decided_by', str(self.user.id))
+        if task.status == Task.Status.COMPLETED:
+            record.status = PendingStatus.APPROVED
+            unapplied = self.unapplied_fields(task)
+            if unapplied:
+                summary.update(apply_failed=True, unapplied_fields=unapplied)
+                record.severity = Severity.CRITICAL
+        else:
+            record.status = PendingStatus.REJECTED
+        record.summary = summary
+        record.resolved_at = timezone.now()
+        record.save(user=self.user)
+        if summary.get('apply_failed') and record.group_id:
+            _open_data_quality_follow_up(
+                self.user, record,
+                f'Approved but not applied: {", ".join(summary["unapplied_fields"])}. '
+                f'Re-enter the change or correct it by hand.')
+        return record
+
+    @staticmethod
+    def unapplied_fields(task):
+        """Fields of an approved task that the record does not hold. The task executor discards
+        the update's result, so this is the only way a failed apply becomes visible."""
+        from individual.models import GroupIndividual
+
+        target = _task_target(task)
+        incoming = (task.data or {}).get('incoming_data') or {}
+        if target is None:
+            return ['<record not found>']
+        missing = []
+        for key, wanted in incoming.items():
+            if key in _NOT_COMPARED:
+                continue
+            if key == 'json_ext':
+                current = target.json_ext or {}
+                missing += [f'json_ext.{k}' for k, val in (wanted or {}).items()
+                            if _norm(current.get(k)) != _norm(val)]
+            elif key == 'individuals_data':
+                members = {str(i) for i in GroupIndividual.objects.filter(
+                    group=target, is_deleted=False).values_list('individual_id', flat=True)}
+                if members != _member_ids(wanted):
+                    missing.append(key)
+            elif hasattr(target, key) and _norm(getattr(target, key)) != _norm(wanted):
+                missing.append(key)
+        return sorted(missing)
+
+
+def pending_changes(record):
+    """Before/after of the fields a pending row names. A proposal reads both from its task; an
+    applied edit reads `after` from the model's history and `before` from the row's snapshot."""
+    summary = record.summary or {}
+    names = summary.get('fields') or []
+    if not names:
+        return None
+    if record.is_proposal and record.task_id:
+        data = record.task.data or {}
+        before, after = data.get('current_data') or {}, data.get('incoming_data') or {}
+        return {n: {'before': _plain(_value_at(before, n)), 'after': _plain(_value_at(after, n))}
+                for n in names}
+    if 'before' not in summary:
+        return None
+    target = record.target
+    version = None
+    if target is not None and summary.get('history_id'):
+        version = target.history.filter(history_id=summary['history_id']).first()
+    after = snapshot(version.instance if version else target) if target is not None else {}
+    return {n: {'before': summary['before'].get(n), 'after': _plain(_value_at(after, n))}
+            for n in names}
+
+
+def _plain(value):
+    return value if value is None or isinstance(value, (str, int, bool, list, dict)) else str(value)

@@ -324,6 +324,8 @@ class PendingDataUpdate(HistoryModel):
         null=True, blank=True, related_name='case_pending_updates',
     )
     summary = models.JSONField(default=dict, blank=True)
+    channel = models.CharField(max_length=20, choices=Channel.choices, null=True, blank=True)
+    is_proposal = models.BooleanField(default=False)
     submitted_by = models.ForeignKey(
         User, models.DO_NOTHING, related_name='case_submitted_updates',
     )

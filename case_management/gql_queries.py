@@ -128,6 +128,8 @@ class CaseFollowUpRemarkGQLType(DjangoObjectType):
 
 class CasePendingDataUpdateGQLType(DjangoObjectType):
     uuid = graphene.String(source='uuid')
+    changes = graphene.JSONString(
+        description="Before/after of the changed fields, from the task (proposed) or history (applied).")
 
     class Meta:
         model = PendingDataUpdate
@@ -141,6 +143,8 @@ class CasePendingDataUpdateGQLType(DjangoObjectType):
             "update_type": ["exact", "in"],
             "status": ["exact", "in"],
             "severity": ["exact", "in"],
+            "channel": ["exact", "in", "isnull"],
+            "is_proposal": ["exact"],
             "submitted_by_id": ["exact"],
             "date_created": ["exact", "gt", "gte", "lt", "lte"],
             "is_deleted": ["exact"],
@@ -150,6 +154,10 @@ class CasePendingDataUpdateGQLType(DjangoObjectType):
     @classmethod
     def get_queryset(cls, queryset, info):
         return PendingDataUpdate.get_queryset(queryset, info.context.user)
+
+    def resolve_changes(root, info):
+        from case_management.services import pending_changes
+        return pending_changes(root)
 
 
 class VerificationAttemptGQLType(graphene.ObjectType):
@@ -215,6 +223,11 @@ class CaseStatusCountGQLType(graphene.ObjectType):
     count = graphene.Int()
 
 
+class CaseChannelCountGQLType(graphene.ObjectType):
+    channel = graphene.String()
+    count = graphene.Int()
+
+
 class CaseManagementSummaryGQLType(graphene.ObjectType):
     open_corrections = graphene.Int()
     open_follow_ups = graphene.Int()
@@ -225,3 +238,4 @@ class CaseManagementSummaryGQLType(graphene.ObjectType):
     payment_changes = graphene.Int()
     follow_ups_by_status = graphene.List(CaseStatusCountGQLType)
     pending_by_status = graphene.List(CaseStatusCountGQLType)
+    pending_by_channel = graphene.List(CaseChannelCountGQLType)
