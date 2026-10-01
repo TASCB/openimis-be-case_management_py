@@ -1,4 +1,3 @@
-import re
 from datetime import date
 
 CM_REASON_REQUIRED = 'CM_REASON_REQUIRED'
@@ -23,7 +22,6 @@ CM_NOT_FOUND = 'CM_NOT_FOUND'
 CM_TASK_CREATE_FAILED = 'CM_TASK_CREATE_FAILED'
 CM_ALREADY_DECIDED = 'CM_ALREADY_DECIDED'
 
-PHONE_RE = re.compile(r'^(?:\+255|0)[67]\d{8}$')
 OTHER = 'OTHER'
 
 
@@ -64,8 +62,13 @@ def validate_reason(reason_code, reason_text, vocabulary, required, min_text_len
 
 
 def validate_phone(value):
-    require(value and PHONE_RE.match(value.strip()), CM_INVALID_PHONE,
-            'Enter a Tanzanian mobile number, e.g. +255712345678 or 0712345678')
+    """Returns the number in the stored 255XXXXXXXXX form; accepts +255…, 255…, 07… and 7…."""
+    from tasaf_payment import msisdn
+    phone = msisdn.normalise(value)
+    require(msisdn.is_valid(phone), CM_INVALID_PHONE,
+            'Enter a Tanzanian mobile number: 255 followed by 9 digits starting with 6 or 7, '
+            'e.g. 255712345678 or 0712345678')
+    return phone
 
 
 def validate_mobile_account(fsp_type, account_number):

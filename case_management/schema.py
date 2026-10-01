@@ -20,7 +20,7 @@ from case_management.gql_queries import (
     PaymentAccountCorrectionGQLType,
     CaseFollowUpRemarkGQLType,
     CaseHouseholdDeactivationGQLType, CaseMemberDeactivationGQLType,
-    CasePaymentChangeAuditGQLType, CasePendingDataUpdateGQLType,
+    CasePaymentChangeAuditGQLType, CasePendingDataUpdateGQLType, CasePaymentProviderGQLType,
 )
 from case_management.models import (
     FollowUpRemark, FollowUpStatus, HouseholdDeactivation, MemberDeactivation,
@@ -55,9 +55,29 @@ class Query(graphene.ObjectType):
         CaseFollowUpRemarkGQLType, orderBy=graphene.List(of_type=graphene.String),
         overdue_only=graphene.Boolean())
     case_management_summary = graphene.Field(CaseManagementSummaryGQLType)
+    case_payment_providers = graphene.List(CasePaymentProviderGQLType)
 
     case_pending_data_update = OrderedDjangoFilterConnectionField(
         CasePendingDataUpdateGQLType, orderBy=graphene.List(of_type=graphene.String))
+
+    def resolve_case_payment_providers(self, info, **kwargs):
+        user = info.context.user
+        if not (user and user.id and (
+                user.has_perms(CaseManagementConfig.gql_payment_change_update_perms)
+                or user.has_perms(CaseManagementConfig.gql_payment_phone_update_perms))):
+            raise PermissionDenied(_("unauthorized"))
+        from django.db.models import Count
+        from tasaf_payment.models import PaymentAccount
+        from tasaf_payment.muse_setup import provider_list
+        usage = dict(PaymentAccount.objects.filter(is_deleted=False).values_list('fsp_name')
+                     .annotate(n=Count('id')).values_list('fsp_name', 'n'))
+        return [
+            CasePaymentProviderGQLType(
+                name=max(row['names'], key=lambda n: usage.get(n, 0)) if row['names']
+                else (row['bank_name'] or row['fsp_code']),
+                fsp_code=row['fsp_code'], fsp_type=row['fsp_type'])
+            for row in provider_list() if row['fsp_type'] in ('BANK', 'MOBILE')
+        ]
 
     def resolve_case_management_summary(self, info, **kwargs):
         from datetime import date

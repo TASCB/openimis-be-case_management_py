@@ -105,6 +105,7 @@ class CaseFollowUpRemarkGQLType(DjangoObjectType):
             "id": ["exact"],
             "group_id": ["exact"],
             "group__id": ["exact"],
+            "group__code": ["exact", "icontains"],
             "category": ["exact", "in"],
             "status": ["exact", "in"],
             "priority": ["exact", "in"],
@@ -239,3 +240,9 @@ class CaseManagementSummaryGQLType(graphene.ObjectType):
     follow_ups_by_status = graphene.List(CaseStatusCountGQLType)
     pending_by_status = graphene.List(CaseStatusCountGQLType)
     pending_by_channel = graphene.List(CaseChannelCountGQLType)
+
+
+class CasePaymentProviderGQLType(graphene.ObjectType):
+    name = graphene.String()
+    fsp_code = graphene.String()
+    fsp_type = graphene.String()

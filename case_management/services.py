@@ -244,10 +244,9 @@ class PaymentChangeService:
         account = PaymentAccount.objects.filter(id=payment_account_id, is_deleted=False).first()
         v.require(account, v.CM_NOT_FOUND, 'Payment account not found')
         v.validate_version(account, version)
-        v.validate_phone(contact_phone)
+        phone = v.validate_phone(contact_phone)
 
         channel = resolve_channel(channel, request)
-        phone = contact_phone.strip()
         v.require(phone != (account.contact_phone or ''), v.CM_NO_CHANGE, 'Nothing was changed')
 
         with _owning_the_change(), transaction.atomic():
