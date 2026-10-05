@@ -56,9 +56,21 @@ class Query(graphene.ObjectType):
         overdue_only=graphene.Boolean())
     case_management_summary = graphene.Field(CaseManagementSummaryGQLType)
     case_payment_providers = graphene.List(CasePaymentProviderGQLType)
+    case_payment_account = graphene.Field(PaymentAccountCorrectionGQLType, group_id=graphene.UUID(required=True))
 
     case_pending_data_update = OrderedDjangoFilterConnectionField(
         CasePendingDataUpdateGQLType, orderBy=graphene.List(of_type=graphene.String))
+
+    def resolve_case_payment_account(self, info, group_id):
+        user = info.context.user
+        perms = (CaseManagementConfig.gql_payment_change_search_perms
+                 + CaseManagementConfig.gql_payment_change_update_perms
+                 + CaseManagementConfig.gql_payment_phone_update_perms)
+        if not (user and user.id and any(user.has_perms([p]) for p in perms)):
+            raise PermissionDenied(_("unauthorized"))
+        from tasaf_payment.models import PaymentAccount
+        return (PaymentAccount.objects.filter(is_deleted=False, group_beneficiary__group_id=group_id)
+                .order_by('-is_primary', '-date_created').first())
 
     def resolve_case_payment_providers(self, info, **kwargs):
         user = info.context.user
@@ -66,16 +78,9 @@ class Query(graphene.ObjectType):
                 user.has_perms(CaseManagementConfig.gql_payment_change_update_perms)
                 or user.has_perms(CaseManagementConfig.gql_payment_phone_update_perms))):
             raise PermissionDenied(_("unauthorized"))
-        from django.db.models import Count
-        from tasaf_payment.models import PaymentAccount
         from tasaf_payment.muse_setup import provider_list
-        usage = dict(PaymentAccount.objects.filter(is_deleted=False).values_list('fsp_name')
-                     .annotate(n=Count('id')).values_list('fsp_name', 'n'))
         return [
-            CasePaymentProviderGQLType(
-                name=max(row['names'], key=lambda n: usage.get(n, 0)) if row['names']
-                else (row['bank_name'] or row['fsp_code']),
-                fsp_code=row['fsp_code'], fsp_type=row['fsp_type'])
+            CasePaymentProviderGQLType(name=row['name'], fsp_code=row['fsp_code'], fsp_type=row['fsp_type'])
             for row in provider_list() if row['fsp_type'] in ('BANK', 'MOBILE')
         ]
 

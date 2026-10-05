@@ -184,6 +184,8 @@ class PaymentAccountCorrectionGQLType(DjangoObjectType):
     failure_reason = graphene.String()
     location_name = graphene.String()
     verification_attempts = graphene.List(VerificationAttemptGQLType)
+    paid_at = graphene.DateTime()
+    payment_in_flight = graphene.Boolean()
 
     class Meta:
         model = PaymentAccount
@@ -212,6 +214,14 @@ class PaymentAccountCorrectionGQLType(DjangoObjectType):
 
     def resolve_verification_attempts(root, info):
         return list(root.muse_verification_records.order_by('-received_at')[:10])
+
+    def resolve_paid_at(root, info):
+        from tasaf_payment.services import account_paid_at
+        return account_paid_at(root.id)
+
+    def resolve_payment_in_flight(root, info):
+        from tasaf_payment.services import account_payment_in_flight
+        return account_payment_in_flight(root.id)
 
     def resolve_location_name(root, info):
         group = getattr(getattr(root, 'group_beneficiary', None), 'group', None)

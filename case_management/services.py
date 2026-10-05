@@ -181,6 +181,11 @@ class PaymentChangeService:
             required=is_material and CaseManagementConfig.enforce_payment_change_reason,
             min_text_length=CaseManagementConfig.reason_text_min_length)
 
+        if is_material:
+            from tasaf_payment.services import account_payment_in_flight
+            v.require(not account_payment_in_flight(account.id), v.CM_PAYMENT_IN_FLIGHT,
+                      'A payment to this account is still in progress; change it once that payment has finished')
+
         if (is_material and CaseManagementConfig.payment_change_requires_approval
                 and not _approved):
             return self._queue_for_approval(
