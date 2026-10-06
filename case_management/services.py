@@ -3,6 +3,7 @@
 Business rules live here, not in the GraphQL layer: mobile queries the same schema and would
 otherwise bypass them.
 """
+import json
 import contextvars
 import logging
 import uuid
@@ -888,6 +889,16 @@ def _member_ids(value):
     return {str(m.get('individual_id')) for m in (value or []) if isinstance(m, dict)}
 
 
+def _as_dict(value):
+    """json_ext as a dict; task data carries it as a JSON string when it came through GraphQL."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
 def changed_field_names(before, after):
     """Names of the fields `after` changes; json_ext keys as `json_ext.<key>`."""
     names = set()
@@ -896,8 +907,8 @@ def changed_field_names(before, after):
             continue
         old = (before or {}).get(key)
         if key == 'json_ext':
-            old = old if isinstance(old, dict) else {}
-            names |= {f'json_ext.{k}' for k, val in (new or {}).items() if _norm(old.get(k)) != _norm(val)}
+            old, new = _as_dict(old), _as_dict(new)
+            names |= {f'json_ext.{k}' for k, val in new.items() if _norm(old.get(k)) != _norm(val)}
         elif key == 'individuals_data':
             if _member_ids(old) != _member_ids(new):
                 names.add(key)
@@ -945,7 +956,7 @@ def _value_at(values, name):
     top, _, sub = name.partition('.')
     value = (values or {}).get(top)
     if sub:
-        return value.get(sub) if isinstance(value, dict) else None
+        return _as_dict(value).get(sub)
     return value
 
 
@@ -1051,8 +1062,8 @@ class DataUpdateService:
             if key in _NOT_COMPARED:
                 continue
             if key == 'json_ext':
-                current = target.json_ext or {}
-                missing += [f'json_ext.{k}' for k, val in (wanted or {}).items()
+                current = _as_dict(target.json_ext)
+                missing += [f'json_ext.{k}' for k, val in _as_dict(wanted).items()
                             if _norm(current.get(k)) != _norm(val)]
             elif key == 'individuals_data':
                 members = {str(i) for i in GroupIndividual.objects.filter(

@@ -23,6 +23,12 @@ class ChangedFieldNamesTest(SimpleTestCase):
         after = {'json_ext': {'national_id': '2', 'phone': 'a'}}
         self.assertEqual(changed_field_names(before, after), ['json_ext.national_id'])
 
+    def test_json_ext_given_as_json_string(self):
+        before = {'json_ext': {'national_id': '1', 'json_ext': {'raw': {'age': '40'}}}}
+        after = {'json_ext': '{"national_id": "2", "json_ext": {"raw": {"age": "40"}}}'}
+        self.assertEqual(changed_field_names(before, after), ['json_ext.national_id'])
+        self.assertEqual(changed_field_names(before, {'json_ext': 'not json'}), [])
+
     def test_mirrored_json_ext_key_counts_once(self):
         before = {'first_name': 'A', 'json_ext': {'first_name': 'A'}}
         after = {'first_name': 'B', 'json_ext': {'first_name': 'B'}}
