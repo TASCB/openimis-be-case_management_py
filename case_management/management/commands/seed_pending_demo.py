@@ -44,15 +44,20 @@ class Command(BaseCommand):
 
     def _accounts(self, fsp_type, n):
         from django.contrib.contenttypes.models import ContentType
-        from tasaf_payment.models import PaymentAccount
+        from tasaf_payment.models import PaylistItem, PaylistItemStatus, PaymentAccount
+        from tasaf_payment.services import PAYLIST_FINISHED_STATUSES
 
         busy = PendingDataUpdate.objects.filter(
             content_type=ContentType.objects.get_for_model(PaymentAccount),
             status=PendingStatus.PENDING, is_deleted=False).values_list('object_id', flat=True)
+        # Paid-account lock: an account with a payment still on a live paylist cannot be changed.
+        in_flight = (PaylistItem.objects.filter(is_deleted=False, status=PaylistItemStatus.PENDING,
+                                                paylist__is_deleted=False)
+                     .exclude(paylist__status__in=PAYLIST_FINISHED_STATUSES).values('payment_account_id'))
         qs = (PaymentAccount.objects
               .filter(is_deleted=False, is_primary=True, json_ext___seed='full_demo', fsp_type=fsp_type,
                       group_beneficiary__isnull=False)
-              .exclude(id__in=[str(i) for i in busy]).order_by('id'))
+              .exclude(id__in=[str(i) for i in busy]).exclude(id__in=in_flight).order_by('id'))
         found = list(qs[:n])
         if len(found) < n:
             raise CommandError(f'Not enough full_demo {fsp_type} accounts; run seed_full_demo first')
@@ -60,8 +65,14 @@ class Command(BaseCommand):
 
     def _households(self, n):
         from individual.models import Group
+        from tasaf_payment.models import PaylistItem
+        paid = PaylistItem.objects.filter(is_deleted=False).values(
+            'payment_account__group_beneficiary__group_id')
+        from django.db.models import Count, Q
         groups = list(Group.objects.filter(is_deleted=False, json_ext___seed='full_demo')
-                      .order_by('id')[50:50 + n])
+                      .exclude(id__in=paid)
+                      .annotate(members=Count('groupindividuals', filter=Q(groupindividuals__is_deleted=False)))
+                      .filter(members__gte=3).order_by('id')[:n])
         if len(groups) < n:
             raise CommandError('Not enough full_demo households; run seed_full_demo first')
         return groups
