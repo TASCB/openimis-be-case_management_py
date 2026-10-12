@@ -20,7 +20,7 @@ from case_management.apps import (
     MATERIAL_PAYMENT_FIELDS, NON_MATERIAL_PAYMENT_FIELDS, CaseManagementConfig,
 )
 from case_management.models import (
-    Channel, ChangeType, DeactivationMode, FollowUpRemark, FollowUpStatus,
+    Channel, ChangeType, DeactivationMode, FollowUpCategory, FollowUpRemark, FollowUpStatus,
     HouseholdDeactivation, MemberDeactivation, PaymentChangeAudit, PendingDataUpdate,
     PendingStatus, Severity, UpdateType,
 )
@@ -221,6 +221,8 @@ class PaymentChangeService:
                 previous_pre_audit_status=previous_pre_audit,
             )
             audit.save(user=self.user)
+            if is_material:
+                self._resolve_payment_failures(account, audit)
 
             approval_request = None
             if is_material and CaseManagementConfig.enable_payment_change_approval:
@@ -239,6 +241,18 @@ class PaymentChangeService:
                              'reason_code': reason_code})
         return output_result_success({'id': str(audit.id), 'is_material': is_material,
                                       'change_type': str(change_type)})
+
+    def _resolve_payment_failures(self, account, audit):
+        from case_management.models import OPEN_FOLLOW_UP_STATUSES
+        open_failures = FollowUpRemark.objects.filter(
+            category=FollowUpCategory.PAYMENT_FAILURE, paylist_item__payment_account=account,
+            status__in=OPEN_FOLLOW_UP_STATUSES, is_deleted=False)
+        for record in open_failures:
+            record.status = FollowUpStatus.RESOLVED
+            record.resolved_at = timezone.now()
+            record.resolution_note = (f'Payment details corrected (change {audit.id}); the account '
+                                      f'is verified again before it is paid.')
+            record.save(user=self.user)
 
     @check_authentication
     @register_service_signal('case_payment_service.update_phone')
