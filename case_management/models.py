@@ -27,6 +27,7 @@ class ChangeType(models.TextChoices):
     CONTACT_PHONE = 'CONTACT_PHONE', _('Contact phone')
     PRIMARY_FLAG = 'PRIMARY_FLAG', _('Primary account flag')
     MULTIPLE = 'MULTIPLE', _('Multiple fields')
+    ACCOUNT_ADDED = 'ACCOUNT_ADDED', _('First account added')
 
 
 class Channel(models.TextChoices):
@@ -326,6 +327,7 @@ class PendingDataUpdate(HistoryModel):
     summary = models.JSONField(default=dict, blank=True)
     channel = models.CharField(max_length=20, choices=Channel.choices, null=True, blank=True)
     is_proposal = models.BooleanField(default=False)
+    is_addition = models.BooleanField(default=False)
     submitted_by = models.ForeignKey(
         User, models.DO_NOTHING, related_name='case_submitted_updates',
     )
@@ -344,7 +346,7 @@ class PendingDataUpdate(HistoryModel):
         constraints = [
             models.UniqueConstraint(
                 fields=['content_type', 'object_id'],
-                condition=Q(status=PendingStatus.PENDING, is_deleted=False),
+                condition=Q(status=PendingStatus.PENDING, is_deleted=False, is_addition=False),
                 name='case_pdu_one_pending_per_target',
             ),
         ]

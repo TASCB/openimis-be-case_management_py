@@ -78,6 +78,67 @@ class UpdatePaymentDetailsMutation(BaseMutation):
             channel=data.get('channel')))
 
 
+class AddPaymentAccountMutation(BaseMutation):
+    _mutation_module = "case_management"
+    _mutation_class = "AddPaymentAccountMutation"
+
+    class Input(OpenIMISMutation.Input):
+        group_id = graphene.UUID(required=True)
+        account_number = graphene.String(required=True)
+        fsp_name = graphene.String(required=True)
+        fsp_type = graphene.String(required=False)
+        account_name = graphene.String(required=False)
+        contact_phone = graphene.String(required=False)
+        reason_text = graphene.String(required=False)
+        channel = graphene.String(required=False)
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        _require(user, CaseManagementConfig.gql_payment_change_update_perms)
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        _strip_client(data)
+        return _run(lambda: PaymentChangeService(user).add_account(
+            group_id=data['group_id'],
+            account_number=data['account_number'],
+            fsp_name=data['fsp_name'],
+            fsp_type=data.get('fsp_type'),
+            account_name=data.get('account_name'),
+            contact_phone=data.get('contact_phone'),
+            reason_text=data.get('reason_text'),
+            channel=data.get('channel')))
+
+
+class ProposeMemberAddMutation(BaseMutation):
+    _mutation_module = "case_management"
+    _mutation_class = "ProposeMemberAddMutation"
+
+    class Input(OpenIMISMutation.Input):
+        group_id = graphene.UUID(required=True)
+        first_name = graphene.String(required=True)
+        last_name = graphene.String(required=True)
+        dob = graphene.Date(required=True)
+        role = graphene.String(required=False)
+        recipient_type = graphene.String(required=False)
+        json_ext = graphene.JSONString(required=False)
+        reason_text = graphene.String(required=False)
+        channel = graphene.String(required=False)
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        _require(user, CaseManagementConfig.gql_member_add_perms)
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        _strip_client(data)
+        return _run(lambda: HouseholdCaseService(user).add_member(
+            group_id=data['group_id'], first_name=data['first_name'], last_name=data['last_name'],
+            dob=data['dob'], role=data.get('role'), recipient_type=data.get('recipient_type'),
+            json_ext=data.get('json_ext'), reason_text=data.get('reason_text'),
+            channel=data.get('channel')))
+
+
 class UpdatePaymentPhoneMutation(BaseMutation):
     """Separate mutation and separate right, deliberately: one method with an optional reason
     would in practice be called without one."""

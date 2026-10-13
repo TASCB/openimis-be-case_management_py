@@ -107,22 +107,25 @@ def on_deactivation_task_complete(**kwargs):
         event = task.get('business_event') or ''
         if event not in (DEACTIVATE_MEMBER_EVENT, DEACTIVATE_HOUSEHOLD_EVENT):
             return
-        if task.get('status') == Task.Status.FAILED:
-            logger.info('case_management: deactivation task %s declined', task.get('id'))
-            return
-
-        data = dict(task.get('data') or {})
-        if data.get('effective_date'):
-            data['effective_date'] = date.fromisoformat(data['effective_date'])
-        if data.get('date_of_death'):
-            data['date_of_death'] = date.fromisoformat(data['date_of_death'])
+        from case_management.services import DataUpdateService
 
         user = User.objects.get(id=result['data']['user']['id'])
-        service = HouseholdCaseService(user)
-        if event == DEACTIVATE_MEMBER_EVENT:
-            service.deactivate_member(_approved=True, **data)
+        if task.get('status') == Task.Status.FAILED:
+            logger.info('case_management: deactivation task %s declined', task.get('id'))
         else:
-            service.deactivate_household(_approved=True, **data)
+            data = dict(task.get('data') or {})
+            if data.get('effective_date'):
+                data['effective_date'] = date.fromisoformat(data['effective_date'])
+            if data.get('date_of_death'):
+                data['date_of_death'] = date.fromisoformat(data['date_of_death'])
+            service = HouseholdCaseService(user)
+            if event == DEACTIVATE_MEMBER_EVENT:
+                service.deactivate_member(_approved=True, **data)
+            else:
+                service.deactivate_household(_approved=True, **data)
+        task_obj = Task.objects.filter(id=task.get('id')).first()
+        if task_obj is not None:
+            DataUpdateService(user).close_for_task(task_obj)
     except Exception:
         logger.exception('case_management: deactivation task handler failed')
 

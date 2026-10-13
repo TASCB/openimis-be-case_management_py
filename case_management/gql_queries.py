@@ -146,6 +146,7 @@ class CasePendingDataUpdateGQLType(DjangoObjectType):
             "severity": ["exact", "in"],
             "channel": ["exact", "in", "isnull"],
             "is_proposal": ["exact"],
+            "is_addition": ["exact"],
             "submitted_by_id": ["exact"],
             "date_created": ["exact", "gt", "gte", "lt", "lte"],
             "is_deleted": ["exact"],
@@ -250,6 +251,17 @@ class CaseManagementSummaryGQLType(graphene.ObjectType):
     follow_ups_by_status = graphene.List(CaseStatusCountGQLType)
     pending_by_status = graphene.List(CaseStatusCountGQLType)
     pending_by_channel = graphene.List(CaseChannelCountGQLType)
+
+
+class CaseChangeOutcomeGQLType(graphene.ObjectType):
+    client_mutation_id = graphene.String()
+    mutation_status = graphene.Int()
+    mutation_error = graphene.String()
+    pending_id = graphene.String()
+    status = graphene.String()
+    decision_note = graphene.String()
+    resolved_at = graphene.DateTime()
+    applied = graphene.Boolean()
 
 
 class CasePaymentProviderGQLType(graphene.ObjectType):

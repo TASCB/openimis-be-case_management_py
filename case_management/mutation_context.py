@@ -23,6 +23,14 @@ def current_channel():
     return ctx['channel'] if ctx else None
 
 
+def current_client_mutation_id():
+    ctx = _CTX.get()
+    if not ctx or not ctx.get('mutation_log_id'):
+        return None
+    from core.models import MutationLog
+    return MutationLog.objects.filter(id=ctx['mutation_log_id']).values_list('client_mutation_id', flat=True).first()
+
+
 def channel_from_extensions(extensions):
     if isinstance(extensions, str):
         try:

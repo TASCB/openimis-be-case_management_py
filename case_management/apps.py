@@ -39,6 +39,7 @@ DEFAULT_CONFIG = {
     'gql_account_correction_search_perms': ['290205'],
     'gql_payment_change_update_perms': ['290203'],
     'gql_payment_phone_update_perms': ['290204'],
+    'gql_member_add_perms': ['290203'],
     # Deactivation
     'gql_deactivation_search_perms': ['290301'],
     'gql_deactivation_create_perms': ['290302'],
@@ -96,6 +97,7 @@ class CaseManagementConfig(AppConfig):
     gql_account_correction_search_perms = []
     gql_payment_change_update_perms = []
     gql_payment_phone_update_perms = []
+    gql_member_add_perms = []
     gql_deactivation_search_perms = []
     gql_deactivation_create_perms = []
     gql_reactivation_perms = []

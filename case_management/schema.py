@@ -8,7 +8,10 @@ from django.utils.translation import gettext as _
 from core.schema import OrderedDjangoFilterConnectionField
 
 from case_management.apps import CaseManagementConfig
+from case_management.models import _scope_to_user
 from case_management.gql_mutations import (
+    AddPaymentAccountMutation,
+    ProposeMemberAddMutation,
     AddFollowUpRemarkMutation, DeactivateHouseholdMutation, DeactivateMemberMutation,
     DecidePendingUpdateMutation, ReactivateHouseholdMutation, ReactivateMemberMutation,
     ReversePropagationMutation,
@@ -21,6 +24,7 @@ from case_management.gql_queries import (
     CaseFollowUpRemarkGQLType,
     CaseHouseholdDeactivationGQLType, CaseMemberDeactivationGQLType,
     CasePaymentChangeAuditGQLType, CasePendingDataUpdateGQLType, CasePaymentProviderGQLType,
+    CaseChangeOutcomeGQLType,
 )
 from case_management.models import (
     FollowUpRemark, FollowUpStatus, HouseholdDeactivation, MemberDeactivation,
@@ -31,6 +35,9 @@ from case_management.models import (
 def _check(user, perms):
     if not user or user.is_anonymous or not user.id or not user.has_perms(perms):
         raise PermissionDenied(_("unauthorized"))
+
+
+ACCOUNT_LOCATION = 'group_beneficiary__group__location'
 
 
 class Query(graphene.ObjectType):
@@ -56,6 +63,8 @@ class Query(graphene.ObjectType):
         overdue_only=graphene.Boolean())
     case_management_summary = graphene.Field(CaseManagementSummaryGQLType)
     case_payment_providers = graphene.List(CasePaymentProviderGQLType)
+    case_change_outcomes = graphene.List(
+        CaseChangeOutcomeGQLType, client_mutation_ids=graphene.List(graphene.String, required=True))
     case_payment_account = graphene.Field(PaymentAccountCorrectionGQLType, group_id=graphene.UUID(required=True))
 
     case_pending_data_update = OrderedDjangoFilterConnectionField(
@@ -69,8 +78,44 @@ class Query(graphene.ObjectType):
         if not (user and user.id and any(user.has_perms([p]) for p in perms)):
             raise PermissionDenied(_("unauthorized"))
         from tasaf_payment.models import PaymentAccount
-        return (PaymentAccount.objects.filter(is_deleted=False, group_beneficiary__group_id=group_id)
+        qs = PaymentAccount.objects.filter(is_deleted=False, group_beneficiary__group_id=group_id)
+        return (_scope_to_user(qs, user, ACCOUNT_LOCATION)
                 .order_by('-is_primary', '-date_created').first())
+
+    def resolve_case_change_outcomes(self, info, client_mutation_ids):
+        from core.models import MutationLog
+        from case_management.services import CLIENT_MUTATION_ID
+
+        user = info.context.user
+        if not user or user.is_anonymous or not user.id:
+            raise PermissionDenied(_("unauthorized"))
+        ids = list(dict.fromkeys(i for i in client_mutation_ids if i))[:200]
+        logs = {}
+        for log in MutationLog.objects.filter(client_mutation_id__in=ids, user_id=user.id).order_by('request_date_time'):
+            logs[log.client_mutation_id] = log
+        rows = {}
+        for row in (PendingDataUpdate.objects.filter(is_deleted=False, submitted_by_id=user.id,
+                                                     **{f'json_ext__{CLIENT_MUTATION_ID}__in': ids})
+                    .order_by('date_created')):
+            rows[row.json_ext[CLIENT_MUTATION_ID]] = row
+        outcomes = []
+        for cid in ids:
+            log, row = logs.get(cid), rows.get(cid)
+            if log is None and row is None:
+                continue
+            summary = (row.summary or {}) if row else {}
+            outcomes.append(CaseChangeOutcomeGQLType(
+                client_mutation_id=cid,
+                mutation_status=log.status if log else None,
+                mutation_error=log.error if log else None,
+                pending_id=str(row.id) if row else None,
+                status=row.status if row else None,
+                decision_note=summary.get('decision_note') or summary.get('apply_error'),
+                resolved_at=row.resolved_at if row else None,
+                applied=(row.status == PendingStatus.APPROVED and not summary.get('apply_failed'))
+                if row and row.status != PendingStatus.PENDING else None,
+            ))
+        return outcomes
 
     def resolve_case_payment_providers(self, info, **kwargs):
         user = info.context.user
@@ -91,11 +136,12 @@ class Query(graphene.ObjectType):
 
         from tasaf_payment.models import PaymentAccount, VerificationStatus
 
-        _check(info.context.user, CaseManagementConfig.gql_case_search_perms)
+        user = info.context.user
+        _check(user, CaseManagementConfig.gql_case_search_perms)
 
         live = {'is_deleted': False}
-        follow_ups = FollowUpRemark.objects.filter(**live)
-        pending = PendingDataUpdate.objects.filter(**live)
+        follow_ups = FollowUpRemark.get_queryset(FollowUpRemark.objects.filter(**live), user)
+        pending = PendingDataUpdate.get_queryset(PendingDataUpdate.objects.filter(**live), user)
 
         def by_status(qs):
             rows = qs.values('status').order_by('status').annotate(c=Count('id'))
@@ -105,15 +151,18 @@ class Query(graphene.ObjectType):
                         .values('channel').order_by('channel').annotate(c=Count('id')))
 
         return CaseManagementSummaryGQLType(
-            open_corrections=PaymentAccount.objects.filter(
-                is_deleted=False, verification_status=VerificationStatus.FAILED).count(),
+            open_corrections=_scope_to_user(PaymentAccount.objects.filter(
+                is_deleted=False, verification_status=VerificationStatus.FAILED), user, ACCOUNT_LOCATION).count(),
             open_follow_ups=follow_ups.filter(status__in=OPEN_FOLLOW_UP_STATUSES).count(),
             overdue_follow_ups=follow_ups.filter(
                 status__in=OPEN_FOLLOW_UP_STATUSES, due_date__lt=date.today()).count(),
             pending_updates=pending.filter(status=PendingStatus.PENDING).count(),
-            households_deactivated=HouseholdDeactivation.objects.filter(**live).count(),
-            members_deactivated=MemberDeactivation.objects.filter(**live).count(),
-            payment_changes=PaymentChangeAudit.objects.filter(**live).count(),
+            households_deactivated=HouseholdDeactivation.get_queryset(
+                HouseholdDeactivation.objects.filter(**live), user).count(),
+            members_deactivated=MemberDeactivation.get_queryset(
+                MemberDeactivation.objects.filter(**live), user).count(),
+            payment_changes=PaymentChangeAudit.get_queryset(
+                PaymentChangeAudit.objects.filter(**live), user).count(),
             follow_ups_by_status=by_status(follow_ups),
             pending_by_status=by_status(pending),
             pending_by_channel=[CaseChannelCountGQLType(channel=r['channel'], count=r['c'])
@@ -133,7 +182,8 @@ class Query(graphene.ObjectType):
         else:
             qs = PaymentAccount.objects.filter(
                 is_deleted=False, verification_status=VerificationStatus.FAILED)
-        qs = qs.select_related('group_beneficiary__group')
+        qs = _scope_to_user(qs.select_related('group_beneficiary__group'), info.context.user,
+                            ACCOUNT_LOCATION)
 
         if kwargs.get('location_id'):
             qs = qs.filter(group_beneficiary__group__location_id=kwargs['location_id'])
@@ -187,6 +237,8 @@ class Query(graphene.ObjectType):
 class Mutation(graphene.ObjectType):
     update_payment_details = UpdatePaymentDetailsMutation.Field()
     update_payment_phone = UpdatePaymentPhoneMutation.Field()
+    add_payment_account = AddPaymentAccountMutation.Field()
+    propose_member_add = ProposeMemberAddMutation.Field()
     deactivate_household = DeactivateHouseholdMutation.Field()
     reactivate_household = ReactivateHouseholdMutation.Field()
     deactivate_member = DeactivateMemberMutation.Field()

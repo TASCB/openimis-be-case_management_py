@@ -39,6 +39,7 @@ _SINGLE_FIELD_CHANGE_TYPE = {
     'is_primary': ChangeType.PRIMARY_FLAG,
 }
 
+CLIENT_MUTATION_ID = 'client_mutation_id'
 _IN_CASE_MANAGEMENT = contextvars.ContextVar('case_management_active', default=False)
 
 
@@ -54,8 +55,6 @@ def _owning_the_change():
         yield
     finally:
         _IN_CASE_MANAGEMENT.reset(token)
-
-
 
 
 def classify(before, after):
@@ -108,6 +107,73 @@ def _service_result(fn):
     wrapper.__name__ = fn.__name__
     wrapper.__qualname__ = fn.__qualname__
     return wrapper
+
+
+def fsp_type_of(fsp_name):
+    from tasaf_payment.charges import resolve_fsp_code
+    from tasaf_payment.models import FspProfile, PaymentAccount
+    from tasaf_payment.reports import fsp_names_for_code
+
+    code = resolve_fsp_code(fsp_name)
+    profile = FspProfile.objects.filter(is_deleted=False, fsp_code=code).exclude(fsp_type='').first()
+    if profile:
+        return profile.fsp_type
+    types = set(PaymentAccount.objects.filter(is_deleted=False, fsp_name__in=fsp_names_for_code(code))
+                .exclude(fsp_type='').values_list('fsp_type', flat=True).distinct()[:2])
+    return types.pop() if len(types) == 1 else None
+
+
+def normalise_payment_fields(account, fields):
+    from tasaf_payment import msisdn
+    from tasaf_payment.charges import resolve_fsp_code
+
+    out = dict(fields)
+    if out.get('fsp_name') and account.fsp_name and \
+            resolve_fsp_code(out['fsp_name']) == resolve_fsp_code(account.fsp_name):
+        out.pop('fsp_name')
+    if out.get('fsp_name') and not out.get('fsp_type'):
+        inferred = fsp_type_of(out['fsp_name'])
+        if inferred and inferred != account.fsp_type:
+            out['fsp_type'] = inferred
+    if out.get('account_number') and out.get('fsp_type', account.fsp_type) == 'MOBILE':
+        out['account_number'] = msisdn.normalise(out['account_number'])
+    return out
+
+
+MOBILE_PROPOSAL = 'mobile_proposal'
+
+
+def require_in_scope(user, group=None, pending=None):
+    from individual.models import Group
+    from case_management.models import _scope_to_user
+
+    if pending is not None:
+        allowed = PendingDataUpdate.get_queryset(PendingDataUpdate.objects.filter(pk=pending.pk), user).exists()
+    elif group is not None:
+        allowed = _scope_to_user(Group.objects.filter(pk=group.pk), user, 'location').exists()
+    else:
+        return
+    v.require(allowed, v.CM_OUT_OF_SCOPE, 'This household is outside your districts')
+
+
+def from_mobile(channel):
+    return str(channel or '') == Channel.MOBILE
+
+
+class MobileProposalService:
+
+    def __init__(self, user):
+        self.user = user
+
+    @register_service_signal('case_mobile_proposal_service.propose')
+    def propose(self, action, target, group, payload, update_type, severity, summary,
+                channel=Channel.MOBILE, is_addition=False):
+        record = PendingUpdateService(self.user).open(
+            target=target, update_type=update_type, group=group, severity=severity,
+            is_proposal=True, channel=channel, is_addition=is_addition,
+            summary={'source': 'mobile', 'action': action, **summary},
+            json_ext={MOBILE_PROPOSAL: {'action': action, 'payload': payload}})
+        return output_result_success({'queued': True, 'pending_id': str(record.id)})
 
 
 class PaymentChangeService:
@@ -164,11 +230,13 @@ class PaymentChangeService:
 
         account = PaymentAccount.objects.filter(id=payment_account_id, is_deleted=False).first()
         v.require(account, v.CM_NOT_FOUND, 'Payment account not found')
+        require_in_scope(self.user, self._group_of(account))
         v.validate_version(account, version)
         v.require('contact_phone' not in fields, v.CM_USE_PHONE_MUTATION,
                   'Use the phone update to change contact_phone')
 
         channel = resolve_channel(channel, request)
+        fields = normalise_payment_fields(account, fields)
         before = {f: getattr(account, f) for f in TRACKED_PAYMENT_FIELDS}
         change_type, is_material, changed = classify(before, fields)
         v.require(changed, v.CM_NO_CHANGE, 'Nothing was changed')
@@ -187,8 +255,8 @@ class PaymentChangeService:
             v.require(not account_payment_in_flight(account.id), v.CM_PAYMENT_IN_FLIGHT,
                       'A payment to this account is still in progress; change it once that payment has finished')
 
-        if (is_material and CaseManagementConfig.payment_change_requires_approval
-                and not _approved):
+        if not _approved and (from_mobile(channel) or (
+                is_material and CaseManagementConfig.payment_change_requires_approval)):
             return self._queue_for_approval(
                 account,
                 {'payment_account_id': str(payment_account_id),
@@ -242,6 +310,74 @@ class PaymentChangeService:
         return output_result_success({'id': str(audit.id), 'is_material': is_material,
                                       'change_type': str(change_type)})
 
+    @check_authentication
+    @register_service_signal('case_payment_service.add_account')
+    @_service_result
+    def add_account(self, group_id, account_number, fsp_name, fsp_type=None, account_name=None,
+                    contact_phone=None, reason_text=None, channel=None, request=None, _approved=False):
+        from individual.models import Group
+        from social_protection.models import BeneficiaryStatus, GroupBeneficiary
+        from tasaf_payment.models import PaymentAccount
+
+        group = Group.objects.filter(id=group_id, is_deleted=False).first()
+        v.require(group, v.CM_NOT_FOUND, 'Household not found')
+        require_in_scope(self.user, group)
+        beneficiary = (GroupBeneficiary.objects
+                       .filter(group=group, is_deleted=False, status=BeneficiaryStatus.ACTIVE)
+                       .order_by('-date_created').first())
+        v.require(beneficiary, v.CM_HOUSEHOLD_INACTIVE, 'The household is not an active beneficiary')
+        existing = PaymentAccount.objects.filter(
+            is_deleted=False, group_beneficiary__group=group).order_by('-is_primary').first()
+        v.require(existing is None, v.CM_ACCOUNT_EXISTS,
+                  'The household already has a payment account; change it instead',
+                  {'payment_account_id': str(existing.id) if existing else None})
+
+        fsp_type = fsp_type or fsp_type_of(fsp_name)
+        v.require(fsp_name and fsp_type in ('MOBILE', 'BANK'), v.CM_UNKNOWN_PROVIDER,
+                  'Choose a provider from the provider list', {'fsp_name': fsp_name})
+        fields = normalise_payment_fields(PaymentAccount(fsp_type=fsp_type),
+                                          {'account_number': (account_number or '').strip(),
+                                           'fsp_type': fsp_type})
+        account_number = fields['account_number']
+        if fsp_type == 'MOBILE':
+            v.validate_mobile_account(fsp_type, account_number)
+        else:
+            account_number = account_number.replace(' ', '').replace('-', '')
+            v.require(account_number.isdigit() and len(account_number) >= 5, v.CM_INVALID_BANK_ACCOUNT,
+                      'Enter the bank account number: digits only, at least 5')
+        phone = v.validate_phone(contact_phone) if contact_phone else None
+
+        channel = resolve_channel(channel, request)
+        if from_mobile(channel) and not _approved:
+            return MobileProposalService(self.user).propose(
+                'add_account', group, group,
+                {'group_id': str(group.id), 'account_number': account_number, 'fsp_name': fsp_name,
+                 'fsp_type': fsp_type, 'account_name': account_name, 'contact_phone': phone,
+                 'reason_text': reason_text, 'channel': str(channel)},
+                UpdateType.PAYMENT_CHANGE, Severity.CRITICAL,
+                {'change_type': str(ChangeType.ACCOUNT_ADDED), 'fields': ['account_number', 'fsp_name', 'fsp_type']},
+                is_addition=True)
+        with _owning_the_change(), transaction.atomic():
+            account = PaymentAccount(
+                group_beneficiary=beneficiary, account_number=account_number,
+                account_name=(account_name or '').strip() or None, fsp_type=fsp_type,
+                fsp_name=fsp_name.strip(), is_primary=True, contact_phone=phone)
+            account.save(user=self.user)
+            changed = {f: {'before': None, 'after': getattr(account, f)}
+                       for f in ('account_number', 'fsp_type', 'fsp_name', 'account_name', 'contact_phone')
+                       if getattr(account, f)}
+            audit = PaymentChangeAudit(
+                payment_account=account, group_beneficiary_id=beneficiary.id,
+                change_type=ChangeType.ACCOUNT_ADDED, is_material=True, changed_fields=changed,
+                reason_text=reason_text, channel=channel)
+            audit.save(user=self.user)
+            if not _approved:
+                PendingUpdateService(self.user).open(
+                    target=account, update_type=UpdateType.PAYMENT_CHANGE, group=group,
+                    severity=Severity.WARNING, channel=channel,
+                    summary={'change_type': str(ChangeType.ACCOUNT_ADDED), 'fields': sorted(changed)})
+        return output_result_success({'id': str(account.id), 'audit_id': str(audit.id)})
+
     def _resolve_payment_failures(self, account, audit):
         from case_management.models import OPEN_FOLLOW_UP_STATUSES
         open_failures = FollowUpRemark.objects.filter(
@@ -258,16 +394,23 @@ class PaymentChangeService:
     @register_service_signal('case_payment_service.update_phone')
     @_service_result
     def update_phone(self, payment_account_id, contact_phone, version=None,
-                     channel=None, request=None):
+                     channel=None, request=None, _approved=False):
         from tasaf_payment.models import PaymentAccount
 
         account = PaymentAccount.objects.filter(id=payment_account_id, is_deleted=False).first()
         v.require(account, v.CM_NOT_FOUND, 'Payment account not found')
+        require_in_scope(self.user, self._group_of(account))
         v.validate_version(account, version)
         phone = v.validate_phone(contact_phone)
 
         channel = resolve_channel(channel, request)
         v.require(phone != (account.contact_phone or ''), v.CM_NO_CHANGE, 'Nothing was changed')
+        if from_mobile(channel) and not _approved:
+            return MobileProposalService(self.user).propose(
+                'update_phone', account, self._group_of(account),
+                {'payment_account_id': str(account.id), 'contact_phone': phone, 'channel': str(channel)},
+                UpdateType.PAYMENT_CHANGE, Severity.INFO,
+                {'change_type': str(ChangeType.CONTACT_PHONE), 'fields': ['contact_phone']})
 
         with _owning_the_change(), transaction.atomic():
             changed = {'contact_phone': {'before': account.contact_phone, 'after': phone}}
@@ -284,10 +427,11 @@ class PaymentChangeService:
             )
             audit.save(user=self.user)
 
-            PendingUpdateService(self.user).open(
-                target=account, update_type=UpdateType.PAYMENT_CHANGE,
-                severity=Severity.INFO, group=self._group_of(account), channel=channel,
-                summary={'change_type': str(ChangeType.CONTACT_PHONE)})
+            if not _approved:
+                PendingUpdateService(self.user).open(
+                    target=account, update_type=UpdateType.PAYMENT_CHANGE,
+                    severity=Severity.INFO, group=self._group_of(account), channel=channel,
+                    summary={'change_type': str(ChangeType.CONTACT_PHONE)})
         return output_result_success({'id': str(audit.id), 'is_material': False})
 
     def _open_approval(self, account, audit):
@@ -346,11 +490,26 @@ class HouseholdCaseService:
         })
         if not result.get('success'):
             raise v.CaseValidationError('CM_TASK_CREATE_FAILED', result.get('detail'))
+        task_id = (result.get('data') or {}).get('id')
+        self._list_for_decision(business_event, entity, task_id, payload)
         return output_result_success({
             'queued': True,
-            'task_id': (result.get('data') or {}).get('id'),
+            'task_id': task_id,
             **summary,
         })
+
+    def _list_for_decision(self, business_event, entity, task_id, payload):
+        from tasks_management.models import Task
+
+        task = Task.objects.filter(id=task_id).first()
+        if task is None:
+            return
+        group = getattr(entity, 'group', None) or entity
+        PendingUpdateService(self.user).open(
+            target=entity, update_type=UpdateType.DEACTIVATION, group=group,
+            severity=Severity.CRITICAL, task=task, is_proposal=True,
+            summary={'source': 'deactivation', 'event': business_event,
+                     'mode': payload.get('mode'), 'reason_code': payload.get('reason_code')})
 
     @check_authentication
     @register_service_signal('case_household_service.deactivate_household')
@@ -362,6 +521,7 @@ class HouseholdCaseService:
 
         group = Group.objects.filter(id=group_id, is_deleted=False).first()
         v.require(group, v.CM_NOT_FOUND, 'Household not found')
+        require_in_scope(self.user, group)
         v.validate_version(group, version)
         v.validate_reason(reason_code, reason_text,
                           CaseManagementConfig.household_deactivation_reasons,
@@ -389,7 +549,8 @@ class HouseholdCaseService:
             v.validate_no_active_members(active)
             self._require_no_payment_in_flight(group)
 
-        if CaseManagementConfig.deactivation_requires_approval and not _approved:
+        if not _approved and (CaseManagementConfig.deactivation_requires_approval
+                              or from_mobile(resolve_channel())):
             return self._queue_for_approval(
                 DEACTIVATE_HOUSEHOLD_EVENT, group,
                 {'group_id': str(group_id), 'mode': mode, 'reason_code': reason_code,
@@ -409,7 +570,7 @@ class HouseholdCaseService:
     @check_authentication
     @register_service_signal('case_household_service.reactivate_household')
     @_service_result
-    def reactivate_household(self, group_id, reason_text=None):
+    def reactivate_household(self, group_id, reason_text=None, _approved=False):
         from individual.models import Group
 
         group = Group.objects.filter(id=group_id, is_deleted=False).first()
@@ -418,6 +579,13 @@ class HouseholdCaseService:
                   .filter(group=group, reactivated_at__isnull=True, is_deleted=False)
                   .order_by('-date_created').first())
         v.require(record, v.CM_NOT_DEACTIVATED, 'Household is not deactivated')
+        require_in_scope(self.user, group)
+        if from_mobile(resolve_channel()) and not _approved:
+            return MobileProposalService(self.user).propose(
+                'reactivate_household', group, group,
+                {'group_id': str(group.id), 'reason_text': reason_text},
+                UpdateType.DEACTIVATION, Severity.CRITICAL,
+                {'reactivation': True, 'restores_status': record.previous_status, 'reason': reason_text})
 
         with transaction.atomic():
             if record.group_beneficiary_id:
@@ -432,12 +600,19 @@ class HouseholdCaseService:
     @check_authentication
     @register_service_signal('case_household_service.reactivate_member')
     @_service_result
-    def reactivate_member(self, group_individual_id, reason_text=None):
+    def reactivate_member(self, group_individual_id, reason_text=None, _approved=False):
         record = (MemberDeactivation.objects
                   .filter(group_individual_id=group_individual_id,
                           reactivated_at__isnull=True, is_deleted=False)
                   .order_by('-date_created').first())
         v.require(record, v.CM_NOT_DEACTIVATED, 'Member is not deactivated')
+        require_in_scope(self.user, record.group)
+        if from_mobile(resolve_channel()) and not _approved:
+            return MobileProposalService(self.user).propose(
+                'reactivate_member', record.group_individual, record.group,
+                {'group_individual_id': str(group_individual_id), 'reason_text': reason_text},
+                UpdateType.DEACTIVATION, Severity.CRITICAL,
+                {'reactivation': True, 'reason': reason_text})
 
         with transaction.atomic():
             if record.propagation_id:
@@ -473,19 +648,25 @@ class HouseholdCaseService:
         membership = GroupIndividual.objects.filter(
             id=group_individual_id, is_deleted=False).select_related('individual').first()
         v.require(membership, v.CM_NOT_FOUND, 'Member not found')
+        require_in_scope(self.user, membership.group)
         v.validate_version(membership, version)
         v.validate_reason(reason_code, reason_text,
                           CaseManagementConfig.member_deactivation_reasons,
                           required=True,
                           min_text_length=CaseManagementConfig.reason_text_min_length)
         v.validate_effective_date(effective_date)
+        successors = successors or {}
+        if not (reason_code == self.DECEASED or person_level) and self._is_representative(membership) \
+                and self._has_successor_candidate(membership):
+            v.validate_successors([membership.group_id], successors)
 
-        if CaseManagementConfig.deactivation_requires_approval and not _approved:
+        if not _approved and (CaseManagementConfig.deactivation_requires_approval
+                              or from_mobile(resolve_channel())):
             return self._queue_for_approval(
                 DEACTIVATE_MEMBER_EVENT, membership,
                 {'group_individual_id': str(group_individual_id), 'reason_code': reason_code,
                  'reason_text': reason_text, 'effective_date': effective_date,
-                 'date_of_death': date_of_death, 'successors': successors or {},
+                 'date_of_death': date_of_death, 'successors': successors,
                  'person_level': person_level},
                 {'member': f'{membership.individual.first_name} '
                            f'{membership.individual.last_name}'.strip()})
@@ -494,11 +675,7 @@ class HouseholdCaseService:
         if reason_code == self.DECEASED or person_level:
             return self._deactivate_person(
                 membership.individual, reason_code, reason_text, effective_date,
-                date_of_death, successors or {})
-
-        successors = successors or {}
-        if self._is_representative(membership) and self._has_successor_candidate(membership):
-            v.validate_successors([membership.group_id], successors)
+                date_of_death, successors)
 
         with transaction.atomic():
             record = self._end_membership(
@@ -571,30 +748,96 @@ class HouseholdCaseService:
         return output_result_success({'restored': len(records)})
 
     @check_authentication
+    @register_service_signal('case_household_service.add_member')
+    @_service_result
+    def add_member(self, group_id, first_name, last_name, dob, role=None, recipient_type=None,
+                   json_ext=None, reason_text=None, channel=None, _approved=False):
+        from individual.models import Group, GroupIndividual
+        from individual.services import GroupIndividualService, IndividualService
+
+        group = Group.objects.filter(id=group_id, is_deleted=False).first()
+        v.require(group, v.CM_NOT_FOUND, 'Household not found')
+        require_in_scope(self.user, group)
+        first_name, last_name = (first_name or '').strip(), (last_name or '').strip()
+        v.require(first_name and last_name, v.CM_INVALID_MEMBER, 'First and last name are required')
+        if isinstance(dob, str):
+            try:
+                dob = date.fromisoformat(dob)
+            except ValueError:
+                dob = None
+        v.require(isinstance(dob, date) and dob <= date.today(), v.CM_INVALID_MEMBER,
+                  'A date of birth, not in the future, is required')
+        if role in GroupIndividual.Role.names:
+            role = GroupIndividual.Role[role].value
+        if recipient_type in GroupIndividual.RecipientType.names:
+            recipient_type = GroupIndividual.RecipientType[recipient_type].value
+        v.require(not role or role in GroupIndividual.Role.values, v.CM_INVALID_MEMBER,
+                  f'Unknown role {role}', {'allowed': list(GroupIndividual.Role.values)})
+        v.require(not recipient_type or recipient_type in GroupIndividual.RecipientType.values,
+                  v.CM_INVALID_MEMBER, f'Unknown recipient type {recipient_type}')
+        if isinstance(json_ext, str):
+            json_ext = json.loads(json_ext or '{}')
+        v.require(json_ext is None or isinstance(json_ext, dict), v.CM_INVALID_MEMBER,
+                  'jsonExt must be an object')
+        existing = GroupIndividual.objects.filter(
+            group=group, is_deleted=False, individual__first_name__iexact=first_name,
+            individual__last_name__iexact=last_name, individual__dob=dob).first()
+        v.require(existing is None, v.CM_MEMBER_EXISTS, 'This person is already in the household',
+                  {'group_individual_id': str(existing.id) if existing else None})
+
+        if not _approved:
+            return MobileProposalService(self.user).propose(
+                'add_member', group, group,
+                {'group_id': str(group.id), 'first_name': first_name, 'last_name': last_name,
+                 'dob': dob.isoformat(), 'role': role, 'recipient_type': recipient_type,
+                 'json_ext': json_ext or {}, 'reason_text': reason_text},
+                UpdateType.MEMBER_UPDATE,
+                Severity.CRITICAL if recipient_type == 'PRIMARY' else Severity.WARNING,
+                {'fields': ['first_name', 'last_name', 'dob', 'role', 'recipient_type'],
+                 'name': f'{first_name} {last_name}', 'reason': reason_text},
+                channel=resolve_channel(channel), is_addition=True)
+
+        with transaction.atomic():
+            person = IndividualService(self.user).create({
+                'first_name': first_name, 'last_name': last_name, 'dob': dob,
+                'json_ext': json_ext or {}, 'location_id': group.location_id})
+            v.require(person.get('success'), v.CM_INVALID_MEMBER, person.get('detail'))
+            membership = GroupIndividualService(self.user).create({
+                'group_id': group.id, 'individual_id': person['data']['id'],
+                'role': role, 'recipient_type': recipient_type})
+            v.require(membership.get('success'), v.CM_INVALID_MEMBER, membership.get('detail'))
+        return output_result_success({'individual_id': person['data']['id'],
+                                      'group_individual_id': membership['data']['id']})
+
+    @check_authentication
     @_service_result
     def update_representative(self, group_individual_id, role=None, recipient_type=None,
-                              reason_text=None, version=None):
+                              reason_text=None, version=None, _approved=False):
         """Wraps the individual module's alignment service to add reason and audit."""
         from individual.models import GroupIndividual
-        from individual.services import GroupAndGroupIndividualAlignmentService
 
         membership = GroupIndividual.objects.filter(
             id=group_individual_id, is_deleted=False).first()
         v.require(membership, v.CM_NOT_FOUND, 'Member not found')
+        require_in_scope(self.user, membership.group)
         v.validate_version(membership, version)
+        if from_mobile(resolve_channel()) and not _approved:
+            return MobileProposalService(self.user).propose(
+                'update_representative', membership, membership.group,
+                {'group_individual_id': str(membership.id), 'role': role,
+                 'recipient_type': recipient_type, 'reason_text': reason_text},
+                UpdateType.REPRESENTATIVE_CHANGE, Severity.CRITICAL,
+                {'fields': [f for f, value in (('role', role), ('recipient_type', recipient_type)) if value],
+                 'role': role, 'recipient_type': recipient_type, 'reason': reason_text})
 
-        alignment = GroupAndGroupIndividualAlignmentService(self.user)
         with transaction.atomic():
-            if role:
-                alignment.handle_head_change(membership.id, role, membership.group_id)
-            if recipient_type:
-                alignment.handle_primary_recipient_change(
-                    membership.id, recipient_type, membership.group_id)
-            PendingUpdateService(self.user).open(
-                target=membership, update_type=UpdateType.REPRESENTATIVE_CHANGE,
-                severity=Severity.WARNING, group=membership.group,
-                summary={'role': role, 'recipient_type': recipient_type,
-                         'reason': reason_text})
+            self._take_over(membership, role=role, recipient_type=recipient_type)
+            if not _approved:
+                PendingUpdateService(self.user).open(
+                    target=membership, update_type=UpdateType.REPRESENTATIVE_CHANGE,
+                    severity=Severity.WARNING, group=membership.group,
+                    summary={'role': role, 'recipient_type': recipient_type,
+                             'reason': reason_text})
         return output_result_success({'id': str(membership.id)})
 
     def _end_membership(self, membership, reason_code, reason_text, effective_date,
@@ -642,19 +885,31 @@ class HouseholdCaseService:
 
     def _promote_successor(self, successor_id, outgoing):
         from individual.models import GroupIndividual
-        from individual.services import GroupAndGroupIndividualAlignmentService
 
         successor = GroupIndividual.objects.filter(id=successor_id, is_deleted=False).first()
         v.require(successor, v.CM_NOT_FOUND, 'Successor not found')
         v.require(successor.group_id == outgoing.group_id, v.CM_SUCCESSOR_REQUIRED,
                   'The successor must belong to the same household')
-        alignment = GroupAndGroupIndividualAlignmentService(self.user)
-        if outgoing.role == GroupIndividual.Role.HEAD:
-            alignment.handle_head_change(successor.id, GroupIndividual.Role.HEAD,
-                                         successor.group_id)
-        if outgoing.recipient_type == GroupIndividual.RecipientType.PRIMARY:
-            alignment.handle_primary_recipient_change(
-                successor.id, GroupIndividual.RecipientType.PRIMARY, successor.group_id)
+        self._take_over(
+            successor,
+            role=GroupIndividual.Role.HEAD if outgoing.role == GroupIndividual.Role.HEAD else None,
+            recipient_type=(GroupIndividual.RecipientType.PRIMARY
+                            if outgoing.recipient_type == GroupIndividual.RecipientType.PRIMARY else None))
+
+    def _take_over(self, member, role=None, recipient_type=None):
+        from individual.models import GroupIndividual
+
+        others = GroupIndividual.objects.filter(
+            group_id=member.group_id, is_deleted=False).exclude(pk=member.pk)
+        if role == GroupIndividual.Role.HEAD:
+            others.filter(role=GroupIndividual.Role.HEAD).update(role=None)
+        if recipient_type == GroupIndividual.RecipientType.PRIMARY:
+            others.filter(recipient_type=GroupIndividual.RecipientType.PRIMARY).update(recipient_type=None)
+        if role:
+            member.role = role
+        if recipient_type:
+            member.recipient_type = recipient_type
+        member.save(user=self.user)
 
     @staticmethod
     def _is_representative(membership):
@@ -709,6 +964,7 @@ class FollowUpService:
 
         group = Group.objects.filter(id=group_id, is_deleted=False).first()
         v.require(group, v.CM_NOT_FOUND, 'Household not found')
+        require_in_scope(self.user, group)
         v.require(remark and len(remark.strip()) >= 5, v.CM_REASON_TEXT_REQUIRED,
                   'Write at least a few words')
         links = [payment_change_audit_id, paylist_item_id, ticket_id]
@@ -734,6 +990,7 @@ class FollowUpService:
     def update_status(self, remark_id, status, resolution_note=None, version=None):
         record = FollowUpRemark.objects.filter(id=remark_id, is_deleted=False).first()
         v.require(record, v.CM_NOT_FOUND, 'Remark not found')
+        require_in_scope(self.user, record.group)
         v.validate_version(record, version)
         v.require(status != record.status, v.CM_NO_CHANGE, 'Nothing was changed')
 
@@ -753,6 +1010,7 @@ class FollowUpService:
     def assign(self, remark_id, assigned_to_id=None, assigned_role_id=None, version=None):
         record = FollowUpRemark.objects.filter(id=remark_id, is_deleted=False).first()
         v.require(record, v.CM_NOT_FOUND, 'Remark not found')
+        require_in_scope(self.user, record.group)
         v.validate_version(record, version)
         record.assigned_to_id = assigned_to_id
         record.assigned_role_id = assigned_role_id
@@ -774,27 +1032,32 @@ class PendingUpdateService:
 
     def open(self, target, update_type, group=None, severity=Severity.INFO,
              summary=None, task=None, approval_request=None, channel=None,
-             is_proposal=False, location=None):
-        """Open a pending row, superseding any existing one for the same target."""
+             is_proposal=False, location=None, is_addition=False, json_ext=None):
         from django.contrib.contenttypes.models import ContentType
 
         content_type = ContentType.objects.get_for_model(target.__class__)
         object_id = str(target.pk)
-        existing = PendingDataUpdate.objects.filter(
-            content_type=content_type, object_id=object_id,
+        existing = not is_addition and PendingDataUpdate.objects.filter(
+            content_type=content_type, object_id=object_id, is_addition=False,
             status=PendingStatus.PENDING, is_deleted=False).first()
         if existing:
             existing.status = PendingStatus.SUPERSEDED
             existing.resolved_at = timezone.now()
             existing.save(user=self.user)
 
+        from case_management.mutation_context import current_client_mutation_id
+        json_ext = dict(json_ext or {})
+        client_mutation_id = current_client_mutation_id()
+        if client_mutation_id:
+            json_ext.setdefault(CLIENT_MUTATION_ID, client_mutation_id)
         record = PendingDataUpdate(
             content_type=content_type, object_id=object_id,
             group=group, location=location or (group.location if group else None),
             update_type=update_type, status=PendingStatus.PENDING,
             severity=severity, task=task, approval_request=approval_request,
             summary=summary or {}, channel=resolve_channel(channel),
-            is_proposal=is_proposal, submitted_by=self.user)
+            is_proposal=is_proposal, is_addition=is_addition, submitted_by=self.user,
+            json_ext=json_ext)
         record.save(user=self.user)
         return record
 
@@ -805,11 +1068,14 @@ class PendingUpdateService:
         record = PendingDataUpdate.objects.filter(
             id=pending_id, status=PendingStatus.PENDING, is_deleted=False).first()
         v.require(record, v.CM_NOT_FOUND, 'No pending update with that id')
+        require_in_scope(self.user, pending=record)
         v.require(record.submitted_by_id != getattr(self.user, 'id', None), v.CM_SELF_APPROVAL,
                   'An update cannot be approved by the person who submitted it')
 
         if record.is_proposal and record.task_id:
             return self._decide_proposal(record, approve, note)
+        if record.is_proposal and (record.json_ext or {}).get(MOBILE_PROPOSAL):
+            return self._decide_mobile_proposal(record, approve, note)
 
         with transaction.atomic():
             record.status = PendingStatus.APPROVED if approve else PendingStatus.REJECTED
@@ -823,6 +1089,24 @@ class PendingUpdateService:
                         self.user, record,
                         f'Flagged on review: {", ".join(record.summary.get("fields") or [])}. {note or ""}')
         return output_result_success({'id': str(record.id), 'status': record.status})
+
+    def _decide_mobile_proposal(self, record, approve, note):
+        proposal = record.json_ext[MOBILE_PROPOSAL]
+        summary = {**(record.summary or {}), 'decision_note': note, 'decided_by': str(self.user.id)}
+        outcome = None
+        if approve:
+            outcome = apply_mobile_proposal(self.user, proposal.get('action'), proposal.get('payload'))
+            if not outcome.get('success'):
+                summary.update(apply_failed=True, apply_error=str(outcome.get('detail') or outcome.get('message')))
+                record.severity = Severity.CRITICAL
+        record.status = PendingStatus.APPROVED if approve else PendingStatus.REJECTED
+        record.resolved_at = timezone.now()
+        record.summary = summary
+        record.save(user=self.user)
+        if summary.get('apply_failed') and record.group_id:
+            _open_data_quality_follow_up(self.user, record, f"Approved but not applied: {summary['apply_error']}")
+        return output_result_success({'id': str(record.id), 'status': record.status,
+                                      'applied': bool(outcome and outcome.get('success'))})
 
     def _decide_proposal(self, record, approve, note):
         """Drive the task; `on_data_update_task_complete` closes the row, whoever decided."""
@@ -872,8 +1156,6 @@ class PendingUpdateService:
             record.status = status
             record.resolved_at = timezone.now()
             record.save(user=self.user)
-
-
 
 
 # --- Household and member edits made through the individual module -----------------------------
@@ -1096,9 +1378,16 @@ def pending_changes(record):
     names = summary.get('fields') or []
     if not names:
         return None
+    proposal = (record.json_ext or {}).get(MOBILE_PROPOSAL)
+    if record.is_proposal and proposal:
+        payload = proposal.get('payload') or {}
+        target = None if record.is_addition else record.target
+        return {n: {'before': _plain(getattr(target, n, None)) if target is not None else None,
+                    'after': _plain(payload.get(n))} for n in names}
     if record.is_proposal and record.task_id:
         data = record.task.data or {}
-        before, after = data.get('current_data') or {}, data.get('incoming_data') or {}
+        before = data.get('current_data') or data.get('previous') or {}
+        after = data.get('incoming_data') or data.get('fields') or {}
         return {n: {'before': _plain(_value_at(before, n)), 'after': _plain(_value_at(after, n))}
                 for n in names}
     if 'before' not in summary:
@@ -1114,3 +1403,21 @@ def pending_changes(record):
 
 def _plain(value):
     return value if value is None or isinstance(value, (str, int, bool, list, dict)) else str(value)
+
+
+def apply_mobile_proposal(user, action, payload):
+    payload = dict(payload or {})
+    if action == 'update_phone':
+        return PaymentChangeService(user).update_phone(_approved=True, **payload)
+    if action == 'add_account':
+        return PaymentChangeService(user).add_account(_approved=True, **payload)
+    if action == 'update_representative':
+        return HouseholdCaseService(user).update_representative(_approved=True, **payload)
+    if action == 'add_member':
+        return HouseholdCaseService(user).add_member(_approved=True, **payload)
+    if action == 'reactivate_household':
+        return HouseholdCaseService(user).reactivate_household(_approved=True, **payload)
+    if action == 'reactivate_member':
+        return HouseholdCaseService(user).reactivate_member(_approved=True, **payload)
+    return {'success': False, 'detail': f'Unknown mobile proposal action {action}'}
+
