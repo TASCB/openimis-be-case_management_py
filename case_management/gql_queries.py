@@ -4,6 +4,7 @@ from graphene_django import DjangoObjectType
 
 from core import ExtendedConnection
 
+from social_protection.models import GroupBeneficiary
 from tasaf_payment.models import PaymentAccount
 from case_management.models import (
     FollowUpRemark, HouseholdDeactivation, MemberDeactivation, PaymentChangeAudit,
@@ -282,3 +283,42 @@ class CasePaymentProviderGQLType(graphene.ObjectType):
     fsp_type = graphene.String()
     names = graphene.List(graphene.String)
     prefixes = graphene.List(graphene.String)
+
+
+class CaseHouseholdWithoutAccountGQLType(DjangoObjectType):
+    group_id = graphene.String()
+    hhid = graphene.String()
+    recipient_name = graphene.String()
+    location_name = graphene.String()
+    benefit_plan_name = graphene.String()
+    waiting_for_approval = graphene.Boolean()
+
+    class Meta:
+        model = GroupBeneficiary
+        skip_registry = True
+        interfaces = (graphene.relay.Node,)
+        fields = ('id', 'status', 'date_created')
+        filter_fields = {'id': ['exact']}
+        connection_class = ExtendedConnection
+
+    def resolve_group_id(root, info):
+        return str(root.group_id)
+
+    def resolve_hhid(root, info):
+        return root.group.code
+
+    def resolve_recipient_name(root, info):
+        members = root.group.groupindividuals.filter(is_deleted=False).select_related('individual')
+        member = members.filter(recipient_type='PRIMARY').first() or members.filter(role='HEAD').first()
+        if member is None:
+            return None
+        return ' '.join(p for p in (member.individual.first_name, member.individual.last_name) if p)
+
+    def resolve_location_name(root, info):
+        return getattr(root.group.location, 'name', None)
+
+    def resolve_benefit_plan_name(root, info):
+        return getattr(root.benefit_plan, 'name', None)
+
+    def resolve_waiting_for_approval(root, info):
+        return getattr(root, 'waiting_for_approval', False)

@@ -25,6 +25,7 @@ from case_management.gql_queries import (
     CaseHouseholdDeactivationGQLType, CaseMemberDeactivationGQLType,
     CasePaymentChangeAuditGQLType, CasePendingDataUpdateGQLType, CasePaymentProviderGQLType,
     CaseChangeOutcomeGQLType,
+    CaseHouseholdWithoutAccountGQLType,
 )
 from case_management.models import (
     FollowUpRemark, FollowUpStatus, HouseholdDeactivation, MemberDeactivation,
@@ -66,6 +67,13 @@ class Query(graphene.ObjectType):
     case_change_outcomes = graphene.List(
         CaseChangeOutcomeGQLType, client_mutation_ids=graphene.List(graphene.String, required=True))
     case_payment_account = graphene.Field(PaymentAccountCorrectionGQLType, group_id=graphene.UUID(required=True))
+    case_household_without_account = OrderedDjangoFilterConnectionField(
+        CaseHouseholdWithoutAccountGQLType,
+        orderBy=graphene.List(of_type=graphene.String),
+        location_id=graphene.Int(required=False),
+        hhid=graphene.String(required=False),
+        description="Active beneficiary households with no payment account.",
+    )
 
     case_pending_data_update = OrderedDjangoFilterConnectionField(
         CasePendingDataUpdateGQLType, orderBy=graphene.List(of_type=graphene.String))
@@ -172,6 +180,28 @@ class Query(graphene.ObjectType):
             pending_by_channel=[CaseChannelCountGQLType(channel=r['channel'], count=r['c'])
                                 for r in channel_rows],
         )
+
+    def resolve_case_household_without_account(self, info, **kwargs):
+        _check(info.context.user, CaseManagementConfig.gql_account_correction_search_perms)
+        from django.db.models import Exists, OuterRef
+        from social_protection.models import GroupBeneficiary
+        from tasaf_payment.models import PaymentAccount
+        from case_management.models import PendingDataUpdate, PendingStatus, UpdateType
+
+        accounts = PaymentAccount.objects.filter(group_beneficiary=OuterRef('pk'), is_deleted=False)
+        waiting = PendingDataUpdate.objects.filter(
+            group_id=OuterRef('group_id'), update_type=UpdateType.PAYMENT_CHANGE,
+            status=PendingStatus.PENDING, is_deleted=False)
+        qs = (GroupBeneficiary.objects.filter(is_deleted=False, status='ACTIVE', group__is_deleted=False)
+              .annotate(has_account=Exists(accounts), waiting_for_approval=Exists(waiting))
+              .filter(has_account=False)
+              .select_related('group__location', 'benefit_plan'))
+        qs = _scope_to_user(qs, info.context.user, 'group__location')
+        if kwargs.get('location_id'):
+            qs = qs.filter(group__location_id=kwargs['location_id'])
+        if kwargs.get('hhid'):
+            qs = qs.filter(group__code__icontains=kwargs['hhid'])
+        return gql_optimizer.query(qs.order_by('group__code'), info)
 
     def resolve_account_correction(self, info, **kwargs):
         """Accounts to correct: failed verification (default), or mobile-money accounts whose
