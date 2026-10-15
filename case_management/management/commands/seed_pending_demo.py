@@ -42,6 +42,11 @@ class Command(BaseCommand):
 
     # ------------------------------------------------------------------ helpers
 
+    def _districts(self):
+        from location.models import UserDistrict
+        return list(UserDistrict.objects.filter(user=self.decider.i_user, validity_to__isnull=True)
+                    .values_list('location_id', flat=True))
+
     def _accounts(self, fsp_type, n):
         from django.contrib.contenttypes.models import ContentType
         from tasaf_payment.models import PaylistItem, PaylistItemStatus, PaymentAccount
@@ -58,6 +63,8 @@ class Command(BaseCommand):
               .filter(is_deleted=False, is_primary=True, json_ext___seed='full_demo', fsp_type=fsp_type,
                       group_beneficiary__isnull=False)
               .exclude(id__in=[str(i) for i in busy]).exclude(id__in=in_flight).order_by('id'))
+        if self._districts():
+            qs = qs.filter(group_beneficiary__group__location__parent__parent_id__in=self._districts())
         found = list(qs[:n])
         if len(found) < n:
             raise CommandError(f'Not enough full_demo {fsp_type} accounts; run seed_full_demo first')
@@ -69,8 +76,10 @@ class Command(BaseCommand):
         paid = PaylistItem.objects.filter(is_deleted=False).values(
             'payment_account__group_beneficiary__group_id')
         from django.db.models import Count, Q
-        groups = list(Group.objects.filter(is_deleted=False, json_ext___seed='full_demo')
-                      .exclude(id__in=paid)
+        groups = Group.objects.filter(is_deleted=False, json_ext___seed='full_demo')
+        if self._districts():
+            groups = groups.filter(location__parent__parent_id__in=self._districts())
+        groups = list(groups.exclude(id__in=paid)
                       .annotate(members=Count('groupindividuals', filter=Q(groupindividuals__is_deleted=False)))
                       .filter(members__gte=3).order_by('id')[:n])
         if len(groups) < n:
