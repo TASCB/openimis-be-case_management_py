@@ -1421,3 +1421,41 @@ def apply_mobile_proposal(user, action, payload):
         return HouseholdCaseService(user).reactivate_member(_approved=True, **payload)
     return {'success': False, 'detail': f'Unknown mobile proposal action {action}'}
 
+
+
+def accounts_awaiting_reverification():
+    from django.db.models import Exists, OuterRef, Q, Subquery
+    from tasaf_payment.models import MuseVerificationRecord, PaymentAccount, VerificationStatus
+
+    last_reply = (MuseVerificationRecord.objects.filter(payment_account=OuterRef('pk'), is_deleted=False)
+                  .order_by('-received_at').values('received_at')[:1])
+    changes = PaymentChangeAudit.objects.filter(payment_account=OuterRef('pk'), is_material=True, is_deleted=False)
+    return (PaymentAccount.objects.filter(is_deleted=False, verification_status=VerificationStatus.PENDING)
+            .annotate(last_reply=Subquery(last_reply))
+            .annotate(has_change=Exists(changes),
+                      changed_since=Exists(changes.filter(date_created__gt=OuterRef('last_reply'))))
+            .filter(Q(last_reply__isnull=True, has_change=True) | Q(changed_since=True)))
+
+
+def send_changed_accounts_for_verification(user, apply=False):
+    from tasaf_payment.apps import TasafPaymentConfig
+    from tasaf_payment.services import MuseVerificationDispatchService
+
+    accounts = list(accounts_awaiting_reverification().values_list('id', 'fsp_name'))
+    by_provider = {}
+    for _, fsp_name in accounts:
+        by_provider[fsp_name] = by_provider.get(fsp_name, 0) + 1
+    result = {'count': len(accounts), 'by_provider': by_provider, 'sent': 0, 'batches': 0, 'errors': []}
+    if not apply or not accounts:
+        return result
+    size = TasafPaymentConfig.verification_batch_max_rows or 50000
+    ids = [account_id for account_id, _ in accounts]
+    service = MuseVerificationDispatchService(user)
+    for start in range(0, len(ids), size):
+        outcome = service.dispatch(ids[start:start + size], after_change=True)
+        if outcome.get('success'):
+            result['sent'] += outcome.get('count', 0)
+            result['batches'] += outcome.get('batches', 0)
+        else:
+            result['errors'].append(outcome.get('detail') or outcome.get('message') or 'dispatch failed')
+    return result

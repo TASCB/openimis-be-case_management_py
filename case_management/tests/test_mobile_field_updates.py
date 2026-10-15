@@ -113,3 +113,27 @@ class VerificationAttemptNameMatchTest(SimpleTestCase):
         result = self._schema().execute('{ attempt { matchScore matchReason matchMember } }', context_value=record)
         self.assertIsNone(result.errors)
         self.assertEqual(result.data['attempt'], {'matchScore': None, 'matchReason': None, 'matchMember': None})
+
+
+class SendChangedAccountsTest(SimpleTestCase):
+
+    def _run(self, accounts, apply, batch=50000):
+        dispatch = mock.MagicMock(side_effect=lambda ids, after_change: {'success': True, 'count': len(ids), 'batches': 1})
+        queryset = mock.MagicMock()
+        queryset.values_list.return_value = accounts
+        with mock.patch.object(services, 'accounts_awaiting_reverification', return_value=queryset), \
+                mock.patch('tasaf_payment.services.MuseVerificationDispatchService') as service, \
+                mock.patch('tasaf_payment.apps.TasafPaymentConfig.verification_batch_max_rows', batch):
+            service.return_value.dispatch = dispatch
+            return services.send_changed_accounts_for_verification('user', apply=apply), dispatch
+
+    def test_dry_run_counts_by_provider_and_sends_nothing(self):
+        result, dispatch = self._run([(1, 'CRDB Bank'), (2, 'CRDB Bank'), (3, 'M-PESA')], apply=False)
+        self.assertEqual((result['count'], result['by_provider']), (3, {'CRDB Bank': 2, 'M-PESA': 1}))
+        dispatch.assert_not_called()
+
+    def test_apply_sends_in_chunks_marked_as_after_a_change(self):
+        result, dispatch = self._run([(1, 'A'), (2, 'A'), (3, 'B')], apply=True, batch=2)
+        self.assertEqual([c.args[0] for c in dispatch.call_args_list], [[1, 2], [3]])
+        self.assertTrue(all(c.kwargs['after_change'] for c in dispatch.call_args_list))
+        self.assertEqual((result['sent'], result['batches']), (3, 2))
