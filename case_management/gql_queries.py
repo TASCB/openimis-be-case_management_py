@@ -169,6 +169,17 @@ class VerificationAttemptGQLType(graphene.ObjectType):
     result = graphene.String()
     failure_reason = graphene.String()
     received_at = graphene.DateTime()
+    expected_name = graphene.String()
+    returned_name = graphene.String()
+    match_score = graphene.Int()
+    match_reason = graphene.String()
+    match_member = graphene.String()
+
+    def resolve_match_reason(root, info):
+        return (root.match_details or {}).get('reason')
+
+    def resolve_match_member(root, info):
+        return (root.match_details or {}).get('member')
 
 
 class PaymentAccountCorrectionGQLType(DjangoObjectType):
@@ -214,7 +225,8 @@ class PaymentAccountCorrectionGQLType(DjangoObjectType):
         return record.failure_reason if record else None
 
     def resolve_verification_attempts(root, info):
-        return list(root.muse_verification_records.order_by('-received_at')[:10])
+        return list(root.muse_verification_records.filter(is_deleted=False)
+                    .order_by('-received_at')[:10])
 
     def resolve_paid_at(root, info):
         from tasaf_payment.services import account_paid_at

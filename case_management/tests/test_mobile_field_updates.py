@@ -78,3 +78,38 @@ class MobileProposalTest(SimpleTestCase):
         record = self._record({'first_name': 'Asha'}, ['first_name'],
                               target=SimpleNamespace(first_name='Household'), is_addition=True)
         self.assertEqual(services.pending_changes(record), {'first_name': {'before': None, 'after': 'Asha'}})
+
+
+class VerificationAttemptNameMatchTest(SimpleTestCase):
+
+    def _schema(self):
+        import graphene
+        from case_management.gql_queries import VerificationAttemptGQLType
+
+        class Query(graphene.ObjectType):
+            attempt = graphene.Field(VerificationAttemptGQLType)
+
+            def resolve_attempt(root, info):
+                return info.context
+
+        return graphene.Schema(query=Query)
+
+    def test_returned_name_and_score_are_exposed(self):
+        record = SimpleNamespace(
+            muse_reference='R1', verification_type='ACCOUNT', result='FAILED', failure_reason='Name mismatch',
+            received_at=None, expected_name='Juma Ali Hassan', returned_name='Juma Ally', match_score=62,
+            match_details={'reason': 'NAME_MISMATCH', 'member': 'PRIMARY'})
+        result = self._schema().execute(
+            '{ attempt { expectedName returnedName matchScore matchReason matchMember } }', context_value=record)
+        self.assertIsNone(result.errors)
+        self.assertEqual(result.data['attempt'], {
+            'expectedName': 'Juma Ali Hassan', 'returnedName': 'Juma Ally', 'matchScore': 62,
+            'matchReason': 'NAME_MISMATCH', 'matchMember': 'PRIMARY'})
+
+    def test_attempts_before_name_matching_have_no_details(self):
+        record = SimpleNamespace(
+            muse_reference='R0', verification_type='ACCOUNT', result='PASSED', failure_reason=None, received_at=None,
+            expected_name=None, returned_name=None, match_score=None, match_details=None)
+        result = self._schema().execute('{ attempt { matchScore matchReason matchMember } }', context_value=record)
+        self.assertIsNone(result.errors)
+        self.assertEqual(result.data['attempt'], {'matchScore': None, 'matchReason': None, 'matchMember': None})
