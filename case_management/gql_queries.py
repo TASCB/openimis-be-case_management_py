@@ -280,3 +280,5 @@ class CasePaymentProviderGQLType(graphene.ObjectType):
     name = graphene.String()
     fsp_code = graphene.String()
     fsp_type = graphene.String()
+    names = graphene.List(graphene.String)
+    prefixes = graphene.List(graphene.String)

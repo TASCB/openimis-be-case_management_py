@@ -123,9 +123,13 @@ class Query(graphene.ObjectType):
                 user.has_perms(CaseManagementConfig.gql_payment_change_update_perms)
                 or user.has_perms(CaseManagementConfig.gql_payment_phone_update_perms))):
             raise PermissionDenied(_("unauthorized"))
+        from tasaf_payment.apps import TasafPaymentConfig
         from tasaf_payment.muse_setup import provider_list
+        prefixes = TasafPaymentConfig.mobile_prefixes or {}
         return [
-            CasePaymentProviderGQLType(name=row['name'], fsp_code=row['fsp_code'], fsp_type=row['fsp_type'])
+            CasePaymentProviderGQLType(
+                name=row['name'], fsp_code=row['fsp_code'], fsp_type=row['fsp_type'], names=row['names'],
+                prefixes=prefixes.get(row['fsp_code'], []) if row['fsp_type'] == 'MOBILE' else [])
             for row in provider_list() if row['fsp_type'] in ('BANK', 'MOBILE')
         ]
 
