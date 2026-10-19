@@ -132,7 +132,7 @@ class Query(graphene.ObjectType):
                 or user.has_perms(CaseManagementConfig.gql_payment_phone_update_perms))):
             raise PermissionDenied(_("unauthorized"))
         from tasaf_payment.apps import TasafPaymentConfig
-        from tasaf_payment.muse_setup import provider_list
+        from tasaf_payment.muse.setup import provider_list
         prefixes = TasafPaymentConfig.mobile_prefixes or {}
         return [
             CasePaymentProviderGQLType(
