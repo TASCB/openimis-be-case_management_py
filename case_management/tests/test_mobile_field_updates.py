@@ -122,7 +122,7 @@ class SendChangedAccountsTest(SimpleTestCase):
         queryset = mock.MagicMock()
         queryset.values_list.return_value = accounts
         with mock.patch.object(services, 'accounts_awaiting_reverification', return_value=queryset), \
-                mock.patch('tasaf_payment.services.MuseVerificationDispatchService') as service, \
+                mock.patch('tasaf_payment.services.verification_dispatcher') as service, \
                 mock.patch('tasaf_payment.apps.TasafPaymentConfig.verification_batch_max_rows', batch):
             service.return_value.dispatch = dispatch
             return services.send_changed_accounts_for_verification('user', apply=apply), dispatch

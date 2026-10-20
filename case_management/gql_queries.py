@@ -216,8 +216,8 @@ class PaymentAccountCorrectionGQLType(DjangoObjectType):
         return getattr(group, 'code', None)
 
     def resolve_recipient_name(root, info):
-        from tasaf_payment.services import MuseVerificationDispatchService
-        return MuseVerificationDispatchService.recipient_name(root)
+        from tasaf_payment.services import recipient_name
+        return recipient_name(root)
 
     def resolve_failure_reason(root, info):
         record = (root.muse_verification_records

@@ -1439,7 +1439,7 @@ def accounts_awaiting_reverification():
 
 def send_changed_accounts_for_verification(user, apply=False):
     from tasaf_payment.apps import TasafPaymentConfig
-    from tasaf_payment.services import MuseVerificationDispatchService
+    from tasaf_payment.services import verification_dispatcher
 
     accounts = list(accounts_awaiting_reverification().values_list('id', 'fsp_name'))
     by_provider = {}
@@ -1450,12 +1450,12 @@ def send_changed_accounts_for_verification(user, apply=False):
         return result
     size = TasafPaymentConfig.verification_batch_max_rows or 50000
     ids = [account_id for account_id, _ in accounts]
-    service = MuseVerificationDispatchService(user)
+    service = verification_dispatcher(user)
     for start in range(0, len(ids), size):
         outcome = service.dispatch(ids[start:start + size], after_change=True)
         if outcome.get('success'):
             result['sent'] += outcome.get('count', 0)
             result['batches'] += outcome.get('batches', 0)
         else:
-            result['errors'].append(outcome.get('detail') or outcome.get('message') or 'dispatch failed')
+            result['errors'].append(outcome.get('error') or outcome.get('detail') or outcome.get('message') or 'dispatch failed')
     return result
