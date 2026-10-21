@@ -243,6 +243,10 @@ class PaymentChangeService:
         if 'account_number' in fields or 'fsp_type' in fields:
             v.validate_mobile_account(fields.get('fsp_type', account.fsp_type),
                                       fields.get('account_number', account.account_number))
+        if {'account_number', 'fsp_type', 'fsp_name'} & set(fields):
+            v.validate_mobile_provider(fields.get('fsp_type', account.fsp_type),
+                                       fields.get('fsp_name', account.fsp_name),
+                                       fields.get('account_number', account.account_number))
 
         v.validate_reason(
             reason_code, reason_text,
@@ -341,6 +345,7 @@ class PaymentChangeService:
         account_number = fields['account_number']
         if fsp_type == 'MOBILE':
             v.validate_mobile_account(fsp_type, account_number)
+            v.validate_mobile_provider(fsp_type, fsp_name, account_number)
         else:
             account_number = account_number.replace(' ', '').replace('-', '')
             v.require(account_number.isdigit() and len(account_number) >= 5, v.CM_INVALID_BANK_ACCOUNT,

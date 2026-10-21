@@ -41,6 +41,23 @@ def _check(user, perms):
 ACCOUNT_LOCATION = 'group_beneficiary__group__location'
 
 
+def provider_mismatch_q():
+    from tasaf_payment import prefixes
+    from tasaf_payment.reports import fsp_names_for_code
+
+    table = prefixes.table()
+    match = Q(pk__in=[])
+    for code, own in table.items():
+        others = sorted({p for c, owned in table.items() if c != code for p in owned})
+        if not others:
+            continue
+        on_other = Q(account_number__regex=r'^255(%s)' % '|'.join(p[1:] for p in others))
+        if own:
+            on_other &= ~Q(account_number__regex=r'^255(%s)' % '|'.join(p[1:] for p in own))
+        match |= Q(fsp_name__in=fsp_names_for_code(code)) & on_other
+    return match
+
+
 class Query(graphene.ObjectType):
     account_correction = OrderedDjangoFilterConnectionField(
         PaymentAccountCorrectionGQLType,
@@ -50,7 +67,8 @@ class Query(graphene.ObjectType):
         hhid=graphene.String(required=False),
         recipient_name=graphene.String(required=False),
         reason=graphene.String(required=False),
-        description="Payment accounts to correct: reason VERIFICATION_FAILED (default) or INVALID_MOBILE.",
+        description="Payment accounts to correct: reason VERIFICATION_FAILED (default), INVALID_MOBILE "
+                    "or PROVIDER_MISMATCH.",
     )
 
     case_payment_change_audit = OrderedDjangoFilterConnectionField(
@@ -131,13 +149,11 @@ class Query(graphene.ObjectType):
                 user.has_perms(CaseManagementConfig.gql_payment_change_update_perms)
                 or user.has_perms(CaseManagementConfig.gql_payment_phone_update_perms))):
             raise PermissionDenied(_("unauthorized"))
-        from tasaf_payment.apps import TasafPaymentConfig
         from tasaf_payment.muse.setup import provider_list
-        prefixes = TasafPaymentConfig.mobile_prefixes or {}
         return [
             CasePaymentProviderGQLType(
                 name=row['name'], fsp_code=row['fsp_code'], fsp_type=row['fsp_type'], names=row['names'],
-                prefixes=prefixes.get(row['fsp_code'], []) if row['fsp_type'] == 'MOBILE' else [])
+                prefixes=row['mobile_prefixes'])
             for row in provider_list() if row['fsp_type'] in ('BANK', 'MOBILE')
         ]
 
@@ -213,6 +229,8 @@ class Query(graphene.ObjectType):
         if kwargs.get('reason') == 'INVALID_MOBILE':
             qs = PaymentAccount.objects.filter(is_deleted=False, fsp_type='MOBILE').exclude(
                 account_number__regex=MSISDN_DB_PATTERN)
+        elif kwargs.get('reason') == 'PROVIDER_MISMATCH':
+            qs = PaymentAccount.objects.filter(provider_mismatch_q(), is_deleted=False, fsp_type='MOBILE')
         else:
             qs = PaymentAccount.objects.filter(
                 is_deleted=False, verification_status=VerificationStatus.FAILED)

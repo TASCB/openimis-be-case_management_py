@@ -8,6 +8,7 @@ CM_USE_PHONE_MUTATION = 'CM_USE_PHONE_MUTATION'
 CM_USE_PAYMENT_MUTATION = 'CM_USE_PAYMENT_MUTATION'
 CM_INVALID_PHONE = 'CM_INVALID_PHONE'
 CM_INVALID_MOBILE_ACCOUNT = 'CM_INVALID_MOBILE_ACCOUNT'
+CM_PROVIDER_MISMATCH = 'CM_PROVIDER_MISMATCH'
 CM_ACTIVE_MEMBERS_EXIST = 'CM_ACTIVE_MEMBERS_EXIST'
 CM_SUCCESSOR_REQUIRED = 'CM_SUCCESSOR_REQUIRED'
 CM_PAYMENT_IN_FLIGHT = 'CM_PAYMENT_IN_FLIGHT'
@@ -82,6 +83,20 @@ def validate_mobile_account(fsp_type, account_number):
     if fsp_type == 'MOBILE':
         require(msisdn.is_valid(msisdn.normalise(account_number)), CM_INVALID_MOBILE_ACCOUNT,
                 'Enter a Tanzanian mobile number: 255 followed by 9 digits starting with 6 or 7')
+
+
+def validate_mobile_provider(fsp_type, fsp_name, account_number):
+    from tasaf_payment import msisdn, prefixes
+    from tasaf_payment.models import PaymentAccount
+    if fsp_type != 'MOBILE':
+        return
+    problem = prefixes.problem(PaymentAccount(fsp_type=fsp_type, fsp_name=fsp_name,
+                                              account_number=msisdn.normalise(account_number)))
+    if problem and problem['code'] == prefixes.PROVIDER_MISMATCH:
+        require(False, CM_PROVIDER_MISMATCH,
+                f"{problem['prefix']} is a {problem['belongs_to']} number; choose {problem['belongs_to']} "
+                f"as the provider or check the number",
+                {'prefix': problem['prefix'], 'belongs_to': problem['belongs_to'], 'saved': problem['saved']})
 
 
 def validate_effective_date(effective_date, not_before=None):
