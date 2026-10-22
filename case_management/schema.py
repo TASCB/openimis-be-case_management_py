@@ -202,7 +202,7 @@ class Query(graphene.ObjectType):
         from django.db.models import Exists, OuterRef
         from social_protection.models import GroupBeneficiary
         from tasaf_payment.models import PaymentAccount
-        from case_management.models import PendingDataUpdate, PendingStatus, UpdateType
+        from case_management.models import UpdateType
 
         accounts = PaymentAccount.objects.filter(group_beneficiary=OuterRef('pk'), is_deleted=False)
         waiting = PendingDataUpdate.objects.filter(
@@ -223,7 +223,10 @@ class Query(graphene.ObjectType):
         """Accounts to correct: failed verification (default), or mobile-money accounts whose
         number is not 255 + 9 digits. Corrected accounts leave the list on their own."""
         _check(info.context.user, CaseManagementConfig.gql_account_correction_search_perms)
-        from django.db.models import F, OuterRef, Subquery
+        from django.contrib.contenttypes.models import ContentType
+        from django.db.models import CharField, Exists, F, OuterRef, Subquery
+        from django.db.models.functions import Cast
+        from case_management.models import PendingDataUpdate, PendingStatus, UpdateType
         from tasaf_payment.models import (
             MuseVerificationRecord, MuseVerificationResult, PaymentAccount, VerificationStatus,
         )
@@ -264,7 +267,11 @@ class Query(graphene.ObjectType):
                         .filter(payment_account=OuterRef('pk'), result=MuseVerificationResult.FAILED,
                                 is_deleted=False)
                         .order_by('-received_at').values('received_at')[:1])
-        qs = qs.annotate(failed_on=Subquery(last_failure)).order_by(
+        waiting = PendingDataUpdate.objects.filter(
+            content_type=ContentType.objects.get_for_model(PaymentAccount),
+            object_id=Cast(OuterRef('pk'), CharField()), update_type=UpdateType.PAYMENT_CHANGE,
+            status=PendingStatus.PENDING, is_deleted=False)
+        qs = qs.annotate(failed_on=Subquery(last_failure), waiting_for_approval=Exists(waiting)).order_by(
             F('failed_on').desc(nulls_last=True), '-date_updated')
         return gql_optimizer.query(qs, info)
 

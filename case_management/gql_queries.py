@@ -183,6 +183,30 @@ class VerificationAttemptGQLType(graphene.ObjectType):
         return (root.match_details or {}).get('member')
 
 
+class CasePendingChangeGQLType(graphene.ObjectType):
+    id = graphene.String()
+    submitted_by = graphene.String()
+    submitted_at = graphene.DateTime()
+    fields = graphene.JSONString()
+    previous = graphene.JSONString()
+
+
+def pending_payment_change(account):
+    from django.contrib.contenttypes.models import ContentType
+    from case_management.models import PendingStatus, UpdateType
+
+    record = (PendingDataUpdate.objects
+              .filter(content_type=ContentType.objects.get_for_model(PaymentAccount), object_id=str(account.pk),
+                      update_type=UpdateType.PAYMENT_CHANGE, status=PendingStatus.PENDING, is_deleted=False)
+              .select_related('task', 'submitted_by').order_by('-date_created').first())
+    if record is None:
+        return None
+    data = (record.task.data if record.task_id else None) or {}
+    return CasePendingChangeGQLType(
+        id=str(record.id), submitted_by=getattr(record.submitted_by, 'username', ''),
+        submitted_at=record.date_created, fields=data.get('fields') or {}, previous=data.get('previous') or {})
+
+
 class PaymentAccountCorrectionGQLType(DjangoObjectType):
     """A failed account, with the context a field team needs to act on it.
 
@@ -201,6 +225,8 @@ class PaymentAccountCorrectionGQLType(DjangoObjectType):
     payment_in_flight = graphene.Boolean()
     failed_on = graphene.DateTime()
     withdrawn = graphene.Boolean()
+    waiting_for_approval = graphene.Boolean()
+    pending_change = graphene.Field(CasePendingChangeGQLType)
 
     class Meta:
         model = PaymentAccount
@@ -232,6 +258,13 @@ class PaymentAccountCorrectionGQLType(DjangoObjectType):
 
     def resolve_withdrawn(root, info):
         return 'verification_withdrawn' in (root.json_ext or {})
+
+    def resolve_waiting_for_approval(root, info):
+        waiting = getattr(root, 'waiting_for_approval', None)
+        return waiting if waiting is not None else pending_payment_change(root) is not None
+
+    def resolve_pending_change(root, info):
+        return pending_payment_change(root)
 
     def resolve_verification_attempts(root, info):
         return list(root.muse_verification_records.filter(is_deleted=False)

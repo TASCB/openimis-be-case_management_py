@@ -94,3 +94,37 @@ class WithdrawnListTest(TestCase):
         self._fail(sent, False, 30)
         self.assertEqual(self._list(), [new.id, sent.id, old.id])
         self.assertEqual(self._list(reason='WITHDRAWN'), [new.id, old.id])
+
+
+class PendingChangeShownTest(TestCase):
+    def setUp(self):
+        from core.models import User
+        from tasaf_payment.models import PaymentAccount
+        self.user = User.objects.filter(username='Admin').first()
+        self.account = PaymentAccount.objects.filter(is_deleted=False, group_beneficiary__isnull=False).first()
+        if self.user is None or self.account is None:
+            self.skipTest('needs the Admin user and a payment account with a household')
+        PaymentAccount.objects.filter(id=self.account.id).update(
+            fsp_name='Vodacom M-Pesa', fsp_type='MOBILE', account_number='255751000001')
+        for target in ('case_management.services.require_in_scope',
+                       'tasaf_payment.services.account_payment_in_flight'):
+            p = mock.patch(target, return_value=False)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_a_queued_number_change_is_reported_on_the_account(self):
+        from case_management.gql_queries import PaymentAccountCorrectionGQLType as T
+        from case_management.services import PaymentChangeService
+        from tasaf_payment.models import PaymentAccount
+        result = PaymentChangeService(self.user).update_details(
+            str(self.account.id), {'account_number': '0751017945'},
+            reason_code='DATA_CORRECTION', reason_text='Number corrected after a GePG withdrawal')
+        self.assertTrue(result.get('success'), result)
+        self.assertTrue((result.get('data') or {}).get('queued'), result)
+        account = PaymentAccount.objects.get(id=self.account.id)
+        self.assertEqual(account.account_number, '255751000001')
+        change = T.resolve_pending_change(account, None)
+        self.assertEqual(change.fields, {'account_number': '255751017945'})
+        self.assertEqual(change.previous, {'account_number': '255751000001'})
+        self.assertEqual(change.submitted_by, 'Admin')
+        self.assertTrue(T.resolve_waiting_for_approval(account, None))
