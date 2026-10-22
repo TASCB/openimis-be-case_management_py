@@ -68,7 +68,7 @@ class Query(graphene.ObjectType):
         recipient_name=graphene.String(required=False),
         reason=graphene.String(required=False),
         description="Payment accounts to correct: reason VERIFICATION_FAILED (default), INVALID_MOBILE "
-                    "or PROVIDER_MISMATCH.",
+                    "PROVIDER_MISMATCH or WITHDRAWN (held back by a GePG send). Newest failure first.",
     )
 
     case_payment_change_audit = OrderedDjangoFilterConnectionField(
@@ -223,7 +223,10 @@ class Query(graphene.ObjectType):
         """Accounts to correct: failed verification (default), or mobile-money accounts whose
         number is not 255 + 9 digits. Corrected accounts leave the list on their own."""
         _check(info.context.user, CaseManagementConfig.gql_account_correction_search_perms)
-        from tasaf_payment.models import PaymentAccount, VerificationStatus
+        from django.db.models import F, OuterRef, Subquery
+        from tasaf_payment.models import (
+            MuseVerificationRecord, MuseVerificationResult, PaymentAccount, VerificationStatus,
+        )
         from tasaf_payment.msisdn import MSISDN_DB_PATTERN
 
         if kwargs.get('reason') == 'INVALID_MOBILE':
@@ -231,6 +234,9 @@ class Query(graphene.ObjectType):
                 account_number__regex=MSISDN_DB_PATTERN)
         elif kwargs.get('reason') == 'PROVIDER_MISMATCH':
             qs = PaymentAccount.objects.filter(provider_mismatch_q(), is_deleted=False, fsp_type='MOBILE')
+        elif kwargs.get('reason') == 'WITHDRAWN':
+            qs = PaymentAccount.objects.filter(is_deleted=False, verification_status=VerificationStatus.FAILED,
+                                               json_ext__has_key='verification_withdrawn')
         else:
             qs = PaymentAccount.objects.filter(
                 is_deleted=False, verification_status=VerificationStatus.FAILED)
@@ -254,6 +260,12 @@ class Query(graphene.ObjectType):
                 | Q(group_beneficiary__group__groupindividuals__individual__last_name__icontains=term)
             ).distinct()
 
+        last_failure = (MuseVerificationRecord.objects
+                        .filter(payment_account=OuterRef('pk'), result=MuseVerificationResult.FAILED,
+                                is_deleted=False)
+                        .order_by('-received_at').values('received_at')[:1])
+        qs = qs.annotate(failed_on=Subquery(last_failure)).order_by(
+            F('failed_on').desc(nulls_last=True), '-date_updated')
         return gql_optimizer.query(qs, info)
 
     def resolve_case_payment_change_audit(self, info, **kwargs):

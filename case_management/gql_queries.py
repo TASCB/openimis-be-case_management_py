@@ -199,6 +199,8 @@ class PaymentAccountCorrectionGQLType(DjangoObjectType):
     verification_attempts = graphene.List(VerificationAttemptGQLType)
     paid_at = graphene.DateTime()
     payment_in_flight = graphene.Boolean()
+    failed_on = graphene.DateTime()
+    withdrawn = graphene.Boolean()
 
     class Meta:
         model = PaymentAccount
@@ -224,6 +226,12 @@ class PaymentAccountCorrectionGQLType(DjangoObjectType):
                   .exclude(failure_reason__isnull=True).exclude(failure_reason='')
                   .order_by('-date_created').first())
         return record.failure_reason if record else None
+
+    def resolve_failed_on(root, info):
+        return getattr(root, 'failed_on', None)
+
+    def resolve_withdrawn(root, info):
+        return 'verification_withdrawn' in (root.json_ext or {})
 
     def resolve_verification_attempts(root, info):
         return list(root.muse_verification_records.filter(is_deleted=False)
