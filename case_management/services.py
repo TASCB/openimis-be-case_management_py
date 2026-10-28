@@ -394,6 +394,11 @@ class PaymentChangeService:
             record.resolution_note = (f'Payment details corrected (change {audit.id}); the account '
                                       f'is verified again before it is paid.')
             record.save(user=self.user)
+        try:
+            from tasaf_payment.unapplied import apply_provider_change
+        except ImportError:
+            return
+        apply_provider_change(account, self.user)
 
     @check_authentication
     @register_service_signal('case_payment_service.update_phone')
