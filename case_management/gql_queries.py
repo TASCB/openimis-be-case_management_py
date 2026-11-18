@@ -140,6 +140,7 @@ class CasePendingDataUpdateGQLType(DjangoObjectType):
             "id": ["exact"],
             "group_id": ["exact"],
             "group__id": ["exact"],
+            "group__code": ["icontains"],
             "location_id": ["exact"],
             "object_id": ["exact"],
             "update_type": ["exact", "in"],

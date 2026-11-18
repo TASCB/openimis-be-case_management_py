@@ -58,6 +58,15 @@ def provider_mismatch_q():
     return match
 
 
+def _any_level_location(location_uuid):
+    from location.apps import LocationConfig
+    q, key = Q(), "location__uuid"
+    for _i in range(len(LocationConfig.location_types)):
+        q |= Q(**{key: location_uuid})
+        key = key.replace("location__", "location__parent__", 1)
+    return q
+
+
 class Query(graphene.ObjectType):
     account_correction = OrderedDjangoFilterConnectionField(
         PaymentAccountCorrectionGQLType,
@@ -94,7 +103,8 @@ class Query(graphene.ObjectType):
     )
 
     case_pending_data_update = OrderedDjangoFilterConnectionField(
-        CasePendingDataUpdateGQLType, orderBy=graphene.List(of_type=graphene.String))
+        CasePendingDataUpdateGQLType, orderBy=graphene.List(of_type=graphene.String),
+        parent_location=graphene.String(required=False), parent_location_level=graphene.Int(required=False))
 
     def resolve_case_payment_account(self, info, group_id):
         user = info.context.user
@@ -301,8 +311,10 @@ class Query(graphene.ObjectType):
 
     def resolve_case_pending_data_update(self, info, **kwargs):
         _check(info.context.user, CaseManagementConfig.gql_pending_update_search_perms)
-        return gql_optimizer.query(
-            PendingDataUpdate.objects.filter(is_deleted=False).order_by('-date_created'), info)
+        qs = PendingDataUpdate.objects.filter(is_deleted=False)
+        if kwargs.get('parent_location'):
+            qs = qs.filter(_any_level_location(kwargs['parent_location']))
+        return gql_optimizer.query(qs.order_by('-date_created'), info)
 
 
 class Mutation(graphene.ObjectType):
